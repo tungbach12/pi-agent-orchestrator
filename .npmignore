@@ -1,0 +1,11 @@
+# Development-only files: not part of the published package.
+tests/
+tsconfig.json
+*.tgz
+
+# Local state and artifacts must never ship.
+node_modules/
+.pi/
+*.log
+.DS_Store
+Thumbs.db

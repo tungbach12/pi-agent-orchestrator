@@ -1,0 +1,49 @@
+{
+  "name": "pi-agent-orchestrator",
+  "version": "0.1.0",
+  "description": "A Pi port of OpenCode's shell jobs, child subagents, completion notifications, and activity dock",
+  "author": "tungbach12",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tungbach12/pi-agent-orchestrator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tungbach12/pi-agent-orchestrator/issues"
+  },
+  "homepage": "https://github.com/tungbach12/pi-agent-orchestrator#readme",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "opencode",
+    "subagents",
+    "subagent",
+    "background-jobs",
+    "background-tasks",
+    "tui"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
