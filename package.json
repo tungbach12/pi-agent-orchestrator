@@ -1,7 +1,7 @@
 {
   "name": "pi-agent-orchestrator",
   "version": "0.1.0",
-  "description": "A Pi port of OpenCode's shell jobs, child subagents, completion notifications, and activity dock",
+  "description": "Parallel shell jobs and child agents for Pi, with automatic completion notifications and an activity dock",
   "author": "tungbach12",
   "license": "MIT",
   "repository": {
@@ -16,11 +16,11 @@
   "keywords": [
     "pi-package",
     "pi-extension",
-    "opencode",
+    "orchestrator",
     "subagents",
     "subagent",
     "background-jobs",
-    "background-tasks",
+    "parallel",
     "tui"
   ],
   "pi": {
