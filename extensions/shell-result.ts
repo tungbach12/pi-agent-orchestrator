@@ -1,16 +1,18 @@
 /**
- * Shell result helpers adapted from OpenCode.
- *
- * Upstream references:
- * - `packages/core/src/tool/plugin/shell.ts` (BACKGROUND_INSTRUCTION)
- * - `packages/core/src/shell/result.ts` (notice)
+ * Result formatting for the shell tool.
  */
 
-/** Verbatim from OpenCode packages/core/src/tool/plugin/shell.ts. */
+/**
+ * Appended to a background shell result.
+ *
+ * The model already receives an automatic completion notification, so this only
+ * has to say what not to do. Kept short on purpose: it is repeated in the
+ * transcript for every background command.
+ */
 export const BACKGROUND_INSTRUCTION =
-  "You will be notified automatically when the command finishes. The notification will include the command's output. Unless the user explicitly asks otherwise, DO NOT poll for completion, even if you need the final result to continue. Repeatedly sleeping and reading or searching the output file is polling, not useful work. You may read the current output if it lets you do useful work now, but do not repeatedly check it while waiting for the command to finish. Keep working on anything that does not depend on the result. If you have nothing else to do, end your response; you will be resumed automatically when the command finishes.";
+  'The parent session is notified automatically when this command finishes. Do not sleep or poll for completion. Keep working on something that does not depend on the result; if there is nothing else to do, end your response.';
 
-/** Mirrors OpenCode ShellResult.notice. */
+/** Describes how a command ended, when it ended in a way worth reporting. */
 export function shellNotice(output: { exit?: number; signal?: string; timeout?: boolean }): string | undefined {
   if (output.timeout) return 'Timed out before completion';
   if (output.signal !== undefined) return `Killed by ${output.signal}`;
@@ -18,7 +20,10 @@ export function shellNotice(output: { exit?: number; signal?: string; timeout?: 
   return undefined;
 }
 
-/** Mirrors OpenCode resultMessages(): output first, then the background instruction or notice paragraph. */
+/**
+ * Builds the text a shell tool call returns: the output first, then a single
+ * trailing paragraph for the background instruction or the exit notice.
+ */
 export function shellResultText(
   output: { output: string; status?: string; exit?: number; signal?: string; timeout?: boolean },
 ): string {

@@ -1,6 +1,6 @@
 # pi-agent-orchestrator
 
-Parallel shell jobs and child agents for [Pi](https://github.com/earendil-works/pi), with automatic
+Background shell jobs and child agents for [Pi](https://github.com/earendil-works/pi), with automatic
 completion notifications and a dock that shows what is running.
 
 ## Why
@@ -20,18 +20,27 @@ This package adds a small orchestration layer on top of Pi:
 **Shell execution**
 Runs commands in the foreground by default, or hands them to the background and returns immediately.
 Foreground commands default to a 120-second timeout; background commands have none. Output streams to
-a log file as it arrives, and reads are bounded so a noisy build cannot flood the context window.
-Exit code, signal, and timeout are reported as distinct outcomes rather than collapsed into "failed".
+a log file under `.pi/shells/` as it arrives, and reads are bounded so a noisy build cannot flood the
+context window. Exit code, signal, and timeout are reported as distinct outcomes rather than collapsed
+into "failed".
 
 **Child agents**
 Delegates a task to an agent with its own context. Two roles are available:
 
-- `explore` — read-only file-search specialist for locating files and answering questions about a
-  codebase. It cannot write, and its shell use is restricted to read-only commands.
-- `general` — multi-step work with the full tool set.
+- `explore` — search specialist. It gets Pi's `read`, `grep`, `find`, and `ls` tools, plus a shell that
+  is guarded to read-only commands, so it can run `git log` or a build without being able to change
+  anything.
+- `general` — multi-step work with the full tool set, including `bash`, `edit`, and `write`.
 
-Child conversations are persisted and linked to their parent, so passing the returned `sessionID`
-resumes the same conversation — including after restarting Pi.
+Child conversations are real Pi session files linked to their parent, so passing the returned
+`sessionID` resumes the same conversation — including after restarting Pi.
+
+**Read-only guard**
+The `explore` agent's shell is filtered through Pi's own `tool_call` hook. A command that writes —
+`rm`, `git commit`, `npm install`, a redirect into a file, or a chain that hides one — is blocked
+before it runs, and the model gets a message that says which part was rejected. Commands that only
+read, including pipes between two reads, go through. The guard applies to the child session only;
+the parent session keeps its full tool set.
 
 **Job lifecycle**
 Every command and child agent becomes a job that can be inspected, waited on, moved to the
@@ -39,11 +48,12 @@ background, or cancelled. Interrupted work leaves a receipt instead of vanishing
 
 **Completion notifications**
 Background work wakes the parent session when it finishes. Polling is unnecessary, and the tool
-instructions explicitly discourage it.
+descriptions and receipts say so explicitly.
 
 **Activity dock**
-A compact `Subagents` / `Shell` view, plus a full-screen transcript detail with expandable Thought
-and Explored groups, tool history, mouse-wheel scrolling, and interruption.
+A compact `Subagents` / `Shell` view, plus a full-screen detail with expandable Thought and Explored
+groups, tool history, mouse-wheel scrolling, and interruption. The dock uses the active Pi theme, so
+it follows the terminal's colors.
 
 ## Usage
 
@@ -78,12 +88,18 @@ groups toggle on click.
 ## Defaults
 
 - Foreground `shell` timeout: **120,000 ms**. Background runs: no timeout unless one is passed.
-- Agent steps: **unlimited**.
-- Subagent nesting depth: **1**.
+- Subagent nesting depth: **1**. A child session does not load extensions, so it cannot spawn
+  another child.
 - A background launch returns a receipt with its ID and an instruction not to poll.
 - `general` uses Pi's own system prompt; it is not overridden.
 
 ## Design notes
+
+**Native Pi APIs only.** The package uses Pi's own `createAgentSession`, `SessionManager`,
+`DefaultResourceLoader`, `createLocalBashOperations`, and `Theme`. Child sessions are created with
+`noExtensions: true` so the orchestrator is not loaded twice, and they get Pi's own tool names
+(`read`, `grep`, `find`, `ls`, `bash`, `edit`, `write`). The read-only guard is an inline extension
+that uses Pi's `tool_call` hook.
 
 **Durable children, process-local jobs.** Child sessions are real session files linked to their
 parent, so they survive a restart. Running OS processes and live agent runtimes do not: they belong
@@ -101,16 +117,13 @@ selectors keep working normally.
 ## Development
 
 ```bash
-npm install   # dev-only: typescript and @types/node for typechecking
+npm install   # dev-only: typescript, @types/node, jiti
 npm run typecheck
 npm test
 ```
 
-`npm test` runs `node --test` over `tests/`. It covers the job lifecycle, the arrow-key guard, and
-prompt/result formatting. Six of those checks compare text byte-for-byte against the upstream
-reference sources and need a local clone of that repository; set `OPENCODE_UPSTREAM` to its path to
-enable them. Without one they are skipped and the rest still run. Tests are development-only and are
-not published.
+`npm test` runs `node --test` over `tests/`. It covers the job lifecycle, the editor-key guard, and
+the shell result formatting. Tests are development-only and are not published.
 
 ## Install
 
@@ -127,7 +140,3 @@ pi install ./path/to/pi-agent-orchestrator
 ## License
 
 MIT © 2026 tungbach12.
-
-This project was inspired by [OpenCode](https://github.com/anomalyco/opencode) and adapts some of its
-agent prompt text and result-formatting conventions. Those portions remain under OpenCode's MIT
-license; the original notice is reproduced in [LICENSE](LICENSE).

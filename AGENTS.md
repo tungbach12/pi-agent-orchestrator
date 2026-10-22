@@ -2,31 +2,34 @@
 
 These notes apply when developing this package from a checkout. They are not needed to install it.
 
-## Reference source
+## Target platform
 
-OpenCode is the starting point for this package, and the prompts and result formatting still come from
-it. Keep a local clone and point `OPENCODE_UPSTREAM` at it:
+This package targets Pi 1.3.0. Use the APIs Pi itself ships:
 
-```bash
-git clone --depth=1 https://github.com/anomalyco/opencode.git ../opencode
-export OPENCODE_UPSTREAM=../opencode   # PowerShell: $env:OPENCODE_UPSTREAM = "..\opencode"
-```
+- `createAgentSession`, `SessionManager`, `SettingsManager`, `DefaultResourceLoader` from
+  `@earendil-works/pi-coding-agent` for child sessions.
+- `createLocalBashOperations` for running commands, so the shell behavior matches Pi's own `bash`
+  tool (shell selection, process-tree kill, exit-code handling).
+- `Theme` from Pi for every color in the dock. Do not hardcode ANSI sequences.
+- Pi's own tool names (`read`, `grep`, `find`, `ls`, `bash`, `edit`, `write`) for child tool sets.
 
-Inspect the clone before changing shell, job, subagent, or activity semantics. The parity tests in
-`tests/upstream-parity.test.mjs` read it directly and are skipped when it is absent.
+Child sessions are created with `noExtensions: true`. The orchestrator already runs in the parent
+session, and loading it again would register the tools twice.
 
 ## Rules
 
-- Keep adapted prompt text and result formatting close to the reference, and document each deliberate
-  difference in README.md. New behavior that goes beyond the reference is ours to design.
 - Do not hardcode absolute paths in shipped code. Anything positional must come from `ctx.cwd`,
   `process.env`, or a package-relative resolution.
-- Keep tests for `JobRegistry` and the Pi adapter boundaries in this package.
+- Do not import from a package's internal `dist/` paths. Only the public entry point of
+  `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` may be imported.
+- Keep the tool surface small: a tool the model never calls is dead weight in the prompt.
+- Keep tests for `JobRegistry`, the editor-key guard, and the shell result formatting in this
+  package.
 
 ## Checks
 
 ```bash
-npm install   # dev-only: typescript and @types/node for typechecking
+npm install   # dev-only: typescript, @types/node, jiti
 npm run typecheck
 npm test
 ```

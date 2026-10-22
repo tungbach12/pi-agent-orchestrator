@@ -1,17 +1,33 @@
 import { Type, type Static } from 'typebox';
 
+/** A running command or child agent. */
 export type JobKind = 'shell' | 'subagent';
 export type JobStatus = 'running' | 'completed' | 'error' | 'cancelled';
+
+/**
+ * Child agent roles.
+ *
+ * `explore` is read-only: it gets Pi's search tools and no shell, so it cannot
+ * change anything. `general` gets the full coding tool set.
+ */
 export type AgentKind = 'explore' | 'general';
 
+/** Which Pi tools a child agent may use. */
+export const AGENT_TOOLS: Record<AgentKind, readonly string[]> = {
+  explore: ['read', 'grep', 'find', 'ls', 'bash'],
+  general: ['read', 'grep', 'find', 'ls', 'bash', 'edit', 'write'],
+};
+
 export interface ShellOutput {
-  exit?: number;
-  signal?: string;
   shellID: string;
   output: string;
   status: JobStatus;
+  exit?: number;
+  signal?: string;
   timeout?: boolean;
   truncated: boolean;
+  /** Path of the log file holding the full output. */
+  file: string;
 }
 
 export interface JobInfo {
@@ -23,7 +39,7 @@ export interface JobInfo {
   completedAt?: number;
   output?: string;
   error?: string;
-  metadata?: Record<string, unknown>;
+  /** Set once the job runs in the background and needs a completion notice. */
   notificationId?: string;
   recovery?:
     | { kind: 'shell'; parentSessionId: string; shellId: string; command: string }
@@ -70,26 +86,33 @@ export interface ChildRecord {
 }
 
 export const ShellParams = Type.Object({
-  command: Type.String({ description: 'Shell command string to execute.' }),
-  workdir: Type.Optional(Type.String({ description: 'Working directory to execute in. Defaults to the current directory; when possible, avoid cd in the command and set workdir instead.' })),
-  timeout: Type.Optional(Type.Number({ description: 'Timeout in milliseconds. Foreground default is 120000; background defaults to no timeout. Use 0 to disable timeout.' })),
-  background: Type.Optional(Type.Boolean({ description: 'Run in the background and return immediately. The parent session is notified automatically when the command finishes. Do not poll.' })),
+  command: Type.String({ description: 'Shell command to execute.' }),
+  workdir: Type.Optional(Type.String({ description: 'Working directory. Defaults to the current directory; prefer this over cd.' })),
+  timeout: Type.Optional(Type.Number({ description: 'Timeout in milliseconds. Foreground default is 120000; background defaults to no timeout. Use 0 to disable.' })),
+  background: Type.Optional(Type.Boolean({ description: 'Run in the background and return immediately. The parent is notified on completion. Do not poll.' })),
 });
 
 export const SubagentParams = Type.Object({
-  agent: Type.Union([Type.Literal('explore'), Type.Literal('general')], { description: 'The type of specialized child agent to use for this task. If a requested subagent name is not available, treat it as a possible model name and use the model parameter.' }),
-  description: Type.String({ description: 'A short 3-5 word label for the task, displayed to the user.' }),
-  prompt: Type.String({ description: 'The task for the child agent. New child sessions start with fresh context, so include relevant instructions and facts.' }),
+  agent: Type.Union([Type.Literal('explore'), Type.Literal('general')], { description: 'The child agent type. "explore" is a read-only search specialist; "general" does multi-step work.' }),
+  description: Type.String({ description: 'A short 3-5 word label for the task, shown to the user.' }),
+  prompt: Type.String({ description: 'The task for the child agent. Child sessions start with fresh context, so include everything it needs.' }),
   model: Type.Optional(Type.String({ description: 'Set only when the user explicitly asks for a particular model. Use provider/model; do not guess an ID. Defaults to the configured child-agent model, then the parent model.' })),
-  sessionID: Type.Optional(Type.String({ description: 'Continue a specific previous subagent conversation by passing its sessionID. Calls without a sessionID start a new conversation.' })),
-  background: Type.Optional(Type.Boolean({ description: 'Run asynchronously and return immediately. The parent is notified when complete. Do not sleep or poll.' })),
+  sessionID: Type.Optional(Type.String({ description: 'Continue a previous child conversation by passing its sessionID. Omit to start a new one.' })),
+  background: Type.Optional(Type.Boolean({ description: 'Run asynchronously and return immediately. The parent is notified on completion. Do not sleep or poll.' })),
 });
 
 export const JobStatusParams = Type.Object({ id: Type.String({ description: 'Job or shell ID.' }) });
-export const JobWaitParams = Type.Object({ id: Type.String({ description: 'Job or shell ID.' }), timeout: Type.Optional(Type.Number({ description: 'Optional timeout in milliseconds.' })) });
+export const JobWaitParams = Type.Object({
+  id: Type.String({ description: 'Job or shell ID.' }),
+  timeout: Type.Optional(Type.Number({ description: 'Optional timeout in milliseconds.' })),
+});
 export const JobBackgroundParams = Type.Object({ id: Type.String({ description: 'Job ID to move to background.' }) });
 export const JobCancelParams = Type.Object({ id: Type.String({ description: 'Job ID to cancel.' }) });
-export const ShellOutputParams = Type.Object({ shellID: Type.String({ description: 'Shell ID returned by the shell tool.' }), offset: Type.Optional(Type.Number({ description: 'Starting byte offset.' })), limit: Type.Optional(Type.Number({ description: 'Maximum output bytes to return.' })) });
+export const ShellOutputParams = Type.Object({
+  shellID: Type.String({ description: 'Shell ID returned by the shell tool.' }),
+  offset: Type.Optional(Type.Number({ description: 'Starting byte offset.' })),
+  limit: Type.Optional(Type.Number({ description: 'Maximum bytes to return.' })),
+});
 
 export type ShellInput = Static<typeof ShellParams>;
 export type SubagentInput = Static<typeof SubagentParams>;
