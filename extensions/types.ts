@@ -2,21 +2,81 @@ import { Type, type Static } from 'typebox';
 
 /** A running command or child agent. */
 export type JobKind = 'shell' | 'subagent';
-export type JobStatus = 'running' | 'completed' | 'error' | 'cancelled';
+export type JobStatus = 'queued' | 'running' | 'completed' | 'error' | 'cancelled';
 
 /**
  * Child agent roles.
  *
- * `explore` is read-only: it gets Pi's search tools and no shell, so it cannot
- * change anything. `general` gets the full coding tool set.
+ * - `explore` is a fast read-only search specialist.
+ * - `code` is a focused implementation and verification specialist with the full coding tool set.
+ * - `review` is a read-only code/diff auditor that reports concrete findings with file:line evidence.
+ * - `research` is a read-only deep researcher for external docs/repos and local codebase investigation.
+ * - `general` gets the full coding tool set with Pi's default system prompt.
  */
-export type AgentKind = 'explore' | 'general';
+export const AGENT_KINDS = ['explore', 'code', 'review', 'research', 'general'] as const;
+export type AgentKind = (typeof AGENT_KINDS)[number];
 
-/** Which Pi tools a child agent may use. */
-export const AGENT_TOOLS: Record<AgentKind, readonly string[]> = {
-  explore: ['read', 'grep', 'find', 'ls', 'bash'],
-  general: ['read', 'grep', 'find', 'ls', 'bash', 'edit', 'write'],
+/** Base built-in Pi tools available to child sessions before role-based exclusions. */
+export const BASE_CHILD_TOOLS = [
+  'read',
+  'grep',
+  'find',
+  'ls',
+  'bash',
+  'edit',
+  'write',
+  'codemode',
+] as const;
+
+/**
+ * Tools always excluded from child sessions so children cannot recursively
+ * spawn subagents/background jobs or block on interactive user prompts.
+ */
+export const ORCHESTRATOR_EXCLUDED_TOOLS = [
+  'subagent',
+  'shell',
+  'job_status',
+  'job_wait',
+  'job_background',
+  'job_cancel',
+  'shell_output',
+  'ask_user_question',
+  'powershell',
+] as const;
+
+/**
+ * Per-role tool denylist applied after inheriting all parent tools.
+ *
+ * Read-only roles (`explore`, `review`, `research`) exclude file-writing tools
+ * (`edit`, `write`) in addition to the orchestrator tools, while `code` and
+ * `general` keep `edit` and `write`.
+ */
+export const AGENT_EXCLUDED_TOOLS: Record<AgentKind, readonly string[]> = {
+  explore: [...ORCHESTRATOR_EXCLUDED_TOOLS, 'edit', 'write'],
+  code: [...ORCHESTRATOR_EXCLUDED_TOOLS],
+  review: [...ORCHESTRATOR_EXCLUDED_TOOLS, 'edit', 'write'],
+  research: [...ORCHESTRATOR_EXCLUDED_TOOLS, 'edit', 'write'],
+  general: [...ORCHESTRATOR_EXCLUDED_TOOLS],
 };
+
+/** Built-in Pi tools enabled for each child agent role (including `codemode` for batched/scripted tool calls). */
+export const AGENT_TOOLS: Record<AgentKind, readonly string[]> = {
+  explore: BASE_CHILD_TOOLS.filter((tool) => !AGENT_EXCLUDED_TOOLS.explore.includes(tool)),
+  code: BASE_CHILD_TOOLS.filter((tool) => !AGENT_EXCLUDED_TOOLS.code.includes(tool)),
+  review: BASE_CHILD_TOOLS.filter((tool) => !AGENT_EXCLUDED_TOOLS.review.includes(tool)),
+  research: BASE_CHILD_TOOLS.filter((tool) => !AGENT_EXCLUDED_TOOLS.research.includes(tool)),
+  general: BASE_CHILD_TOOLS.filter((tool) => !AGENT_EXCLUDED_TOOLS.general.includes(tool)),
+};
+
+/** Whether the child agent is restricted to read-only operations. */
+export function isReadOnlyAgent(agent: AgentKind): boolean {
+  return agent === 'explore' || agent === 'review' || agent === 'research';
+}
+
+/** Whether the child agent can modify files and use the opt-in post-implementation review gate. */
+export function isCodingAgent(agent: AgentKind): boolean {
+  return agent === 'code' || agent === 'general';
+}
 
 export interface ShellOutput {
   shellID: string;
@@ -48,6 +108,7 @@ export interface JobInfo {
 
 export interface ShellRecord {
   shellID: string;
+  parentSessionId?: string;
   command: string;
   cwd: string;
   file: string;
@@ -63,12 +124,19 @@ export interface ShellRecord {
 }
 
 export interface ToolRecord {
+  toolCallId?: string;
+  /** Set when this tool was invoked from inside another tool (e.g. a `codemode` script). */
+  parentToolCallId?: string;
   name: string;
   input: unknown;
   startedAt: number;
   completedAt?: number;
+  durationMs?: number;
   status: 'running' | 'completed' | 'error';
+  /** Exit code captured from a shell tool result, when available. */
+  exitCode?: number;
   output?: string;
+  details?: unknown;
 }
 
 export interface ChildRecord {
@@ -79,6 +147,9 @@ export interface ChildRecord {
   status: JobStatus;
   startedAt: number;
   completedAt?: number;
+  isThinking?: boolean;
+  thinkingStartedAt?: number;
+  thinkingDurationMs?: number;
   tools: ToolRecord[];
   result?: string;
   error?: string;
@@ -93,12 +164,24 @@ export const ShellParams = Type.Object({
 });
 
 export const SubagentParams = Type.Object({
-  agent: Type.Union([Type.Literal('explore'), Type.Literal('general')], { description: 'The child agent type. "explore" is a read-only search specialist; "general" does multi-step work.' }),
+  agent: Type.Unsafe<AgentKind>({
+    type: 'string',
+    enum: [...AGENT_KINDS],
+    description:
+      'The child agent type: "explore" (read-only codebase search), "code" (focused implementation & verification), "review" (read-only code/diff review), "research" (read-only deep research across web, GitHub & local code), or "general" (full-tool multi-step work).',
+  }),
   description: Type.String({ description: 'A short 3-5 word label for the task, shown to the user.' }),
   prompt: Type.String({ description: 'The task for the child agent. Child sessions start with fresh context, so include everything it needs.' }),
+  expectedOutput: Type.Optional(
+    Type.String({
+      description:
+        'Optional output contract specifying the exact questions, sections, file:line citations, or verification command outputs the child agent must return.',
+    }),
+  ),
   model: Type.Optional(Type.String({ description: 'Set only when the user explicitly asks for a particular model. Use provider/model; do not guess an ID. Defaults to the configured child-agent model, then the parent model.' })),
   sessionID: Type.Optional(Type.String({ description: 'Continue a previous child conversation by passing its sessionID. Omit to start a new one.' })),
   background: Type.Optional(Type.Boolean({ description: 'Run asynchronously and return immediately. The parent is notified on completion. Do not sleep or poll.' })),
+  review: Type.Optional(Type.Boolean({ description: 'For a "code" or "general" coding task, run one independent read-only review against this task after implementation. If review finds concrete gaps, allow one bounded fix and re-review. Adds latency and token cost; does not replace running the required tests.' })),
 });
 
 export const JobStatusParams = Type.Object({ id: Type.String({ description: 'Job or shell ID.' }) });
@@ -110,7 +193,7 @@ export const JobBackgroundParams = Type.Object({ id: Type.String({ description: 
 export const JobCancelParams = Type.Object({ id: Type.String({ description: 'Job ID to cancel.' }) });
 export const ShellOutputParams = Type.Object({
   shellID: Type.String({ description: 'Shell ID returned by the shell tool.' }),
-  offset: Type.Optional(Type.Number({ description: 'Starting byte offset.' })),
+  offset: Type.Optional(Type.Number({ description: 'Starting byte offset (non-negative from start of log, or negative such as -8192 to read from the end of the log).' })),
   limit: Type.Optional(Type.Number({ description: 'Maximum bytes to return.' })),
 });
 

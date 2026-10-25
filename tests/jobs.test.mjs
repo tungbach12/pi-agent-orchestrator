@@ -2,6 +2,94 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { JobRegistry } from '../extensions/jobs.ts';
 
+test('defaults to ten concurrent subagents', () => {
+  assert.equal(new JobRegistry().maxConcurrentAgents, 10);
+});
+
+test('rejects a non-positive concurrency limit', () => {
+  assert.throws(() => new JobRegistry(0), /maxConcurrentAgents must be a positive integer/);
+  assert.throws(() => new JobRegistry(1.5), /maxConcurrentAgents must be a positive integer/);
+});
+
+test('queues subagents when the concurrency limit is full and starts them when a slot opens', async () => {
+  const jobs = new JobRegistry(1);
+  const starts = [];
+  const finish = new Map();
+  const start = (id) => jobs.start({
+    id,
+    type: 'subagent',
+    title: id,
+    started: () => starts.push(id),
+    run: () => new Promise((resolve) => finish.set(id, resolve)),
+  });
+
+  start('first');
+  start('second');
+  start('third');
+  await Promise.resolve();
+
+  assert.deepEqual(starts, ['first']);
+  assert.equal(jobs.get('second').status, 'queued');
+  assert.equal(jobs.get('third').status, 'queued');
+
+  finish.get('first')('done');
+  await jobs.wait('first');
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.deepEqual(starts, ['first', 'second']);
+  assert.equal(jobs.get('third').status, 'queued');
+  finish.get('second')('done');
+  await jobs.wait('second');
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(starts, ['first', 'second', 'third']);
+  finish.get('third')('done');
+  await jobs.wait('third');
+});
+
+test('cancelling a queued subagent removes it without consuming a concurrency slot', async () => {
+  const jobs = new JobRegistry(1);
+  let finish;
+  jobs.start({ id: 'running', type: 'subagent', title: 'running', run: () => new Promise((resolve) => { finish = resolve; }) });
+  jobs.start({ id: 'queued', type: 'subagent', title: 'queued', run: async () => 'should not run' });
+  await Promise.resolve();
+
+  const cancelled = await jobs.cancel('queued');
+  assert.equal(cancelled?.status, 'cancelled');
+  assert.equal(jobs.get('running')?.status, 'running');
+  finish('done');
+  await jobs.wait('running');
+});
+
+test('shell commands run without queueing and do not consume subagent slots', async () => {
+  const jobs = new JobRegistry(1);
+  let finishAgent;
+  jobs.start({
+    id: 'agent-1',
+    type: 'subagent',
+    title: 'a1',
+    run: () => new Promise((resolve) => { finishAgent = resolve; }),
+  });
+  await Promise.resolve();
+
+  // The 1 agent slot is occupied. A shell job must start immediately!
+  const shellJob = jobs.start({
+    id: 'shell-1',
+    type: 'shell',
+    title: 's1',
+    run: async () => 'shell-done',
+  });
+  assert.equal(shellJob.status, 'running', 'shell job runs immediately without queueing');
+
+  const shellResult = await jobs.wait('shell-1');
+  assert.equal(shellResult.info?.status, 'completed');
+  assert.equal(shellResult.info?.output, 'shell-done');
+
+  finishAgent('agent-done');
+  await jobs.wait('agent-1');
+});
+
 test('foreground block returns completed output and bounded consumed history retains it', async () => {
   const jobs = new JobRegistry();
   jobs.start({ id: 'foreground', type: 'shell', title: 'echo', run: async () => 'done' });
@@ -60,10 +148,28 @@ test('a delivered background job stays resolvable through job_status', async () 
   assert.equal(jobs.pendingBackground().length, 0);
 });
 
-test('cancel marks a running job cancelled without waiting for the underlying operation', async () => {
-  const jobs = new JobRegistry();
-  jobs.start({ id: 'cancel', type: 'shell', title: 'slow', run: () => new Promise(() => {}) });
-  assert.equal((await jobs.cancel('cancel'))?.status, 'cancelled');
+test('cancel waits for the operation to stop before releasing its execution slot', async () => {
+  const jobs = new JobRegistry(1);
+  let stop;
+  let starts = 0;
+  jobs.start({
+    id: 'cancel',
+    type: 'subagent',
+    title: 'slow',
+    run: () => new Promise((resolve) => { stop = resolve; }),
+    cancel: () => stop('stopped'),
+  });
+  jobs.start({ id: 'queued', type: 'subagent', title: 'queued', started: () => starts++, run: async () => 'done' });
+  await Promise.resolve();
+
+  const cancelling = jobs.cancel('cancel');
+  await Promise.resolve();
+  assert.equal(starts, 0, 'the queued job does not start while the operation is still active');
+  stop('stopped');
+  assert.equal((await cancelling)?.status, 'cancelled');
+  await Promise.resolve();
+  assert.equal(starts, 1);
+  assert.equal((await jobs.wait('queued')).info?.status, 'completed');
 });
 
 test('consumed job history is persisted and restored', async () => {

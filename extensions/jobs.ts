@@ -1,12 +1,19 @@
 import { randomUUID } from 'node:crypto';
 import type { JobInfo, JobStatus } from './types.js';
 
+/** Maximum number of child agent sessions executing at the same time. */
+export const DEFAULT_MAX_CONCURRENT_AGENTS = 10;
+
 export interface JobStartOptions {
   id: string;
   type: JobInfo['type'];
   title: string;
   recovery?: JobInfo['recovery'];
   run: () => Promise<string>;
+  /** Called after the job acquires an execution slot. */
+  started?: (info: JobInfo) => void;
+  /** Stops the underlying command or child session. */
+  cancel?: () => void | Promise<void>;
   /** Called once the job reaches a terminal state. */
   settled?: (info: JobInfo) => void;
 }
@@ -14,14 +21,23 @@ export interface JobStartOptions {
 interface ActiveJob {
   info: JobInfo;
   promise: Promise<JobInfo>;
+  resolve: (info: JobInfo) => void;
   resolveBackgrounded: (info: JobInfo) => void;
   backgrounded: Promise<JobInfo>;
   blockingSessions: Map<string, number>;
   isBackgrounded: boolean;
+  slotHeld: boolean;
+  cancelRequested: boolean;
+  cancelReason?: string;
+  run: () => Promise<string>;
+  started?: (info: JobInfo) => void;
+  cancel?: () => void | Promise<void>;
+  settled?: (info: JobInfo) => void;
 }
 
-const CONSUMED_LIMIT = 25;
+const CONSUMED_LIMIT = 50;
 const RECOVERY_ENTRY = 'pi-agent-orchestrator.recovery.v1';
+
 type Recoverable = {
   jobId: string;
   notificationId: string;
@@ -33,17 +49,32 @@ type Recoverable = {
 };
 
 /**
- * Process-local registry of running commands and child agents.
+ * Process-local registry of queued and running commands and child agents.
  *
- * A job is "backgrounded" when the parent stops waiting for it. Backgrounded
- * jobs keep running in this process and report their completion to the parent
- * session; nothing here survives a Pi restart except the recovery receipt.
+ * Active execution is bounded. Background jobs keep running in this Pi process
+ * and report completion to their parent; recovery entries record what Pi must
+ * report as interrupted if the process stops before delivery.
  */
 export class JobRegistry {
+  readonly maxConcurrentAgents: number;
   private jobs = new Map<string, ActiveJob>();
+  private queue: ActiveJob[] = [];
+  private activeAgents = 0;
   private consumed: JobInfo[] = [];
   private recoverable = new Map<string, Recoverable>();
+  private recovered = new Set<string>();
   private persist?: (customType: string, data: unknown) => void;
+
+  constructor(maxConcurrentAgents = DEFAULT_MAX_CONCURRENT_AGENTS) {
+    if (!Number.isInteger(maxConcurrentAgents) || maxConcurrentAgents < 1) {
+      throw new Error('maxConcurrentAgents must be a positive integer');
+    }
+    this.maxConcurrentAgents = maxConcurrentAgents;
+  }
+
+  get maxConcurrent(): number {
+    return this.maxConcurrentAgents;
+  }
 
   bindPersistence(
     appendEntry: (customType: string, data: unknown) => void,
@@ -55,9 +86,16 @@ export class JobRegistry {
       .find((entry) => entry.customType === RECOVERY_ENTRY)?.data as
       | { recoverable?: Recoverable[]; consumed?: JobInfo[] }
       | undefined;
-    for (const item of restored?.recoverable ?? []) this.recoverable.set(item.notificationId, item);
-    for (const item of restored?.consumed ?? []) this.consumed.push(item);
-    if (this.consumed.length > CONSUMED_LIMIT) this.consumed = this.consumed.slice(-CONSUMED_LIMIT);
+    // Rebinding occurs when Pi switches sessions in the same process. Preserve
+    // in-memory receipts for jobs that are still alive; merge the new session's
+    // persisted receipts rather than clearing them.
+    for (const item of restored?.recoverable ?? []) {
+      this.recoverable.set(item.notificationId, item);
+      if (!this.jobs.has(item.jobId)) this.recovered.add(item.notificationId);
+    }
+    const consumed = new Map(this.consumed.map((job) => [job.id, job]));
+    for (const job of restored?.consumed ?? []) consumed.set(job.id, job);
+    this.consumed = [...consumed.values()].slice(-CONSUMED_LIMIT);
   }
 
   get(id: string): JobInfo | undefined {
@@ -70,54 +108,51 @@ export class JobRegistry {
 
   start(input: JobStartOptions): JobInfo {
     const existing = this.jobs.get(input.id);
-    if (existing?.info.status === 'running') return existing.info;
+    if (existing && this.isPending(existing.info.status)) return existing.info;
 
-    let resolveBackgrounded!: (info: JobInfo) => void;
-    const backgrounded = new Promise<JobInfo>((resolve) => {
-      resolveBackgrounded = resolve;
+    let resolve!: (info: JobInfo) => void;
+    const promise = new Promise<JobInfo>((complete) => {
+      resolve = complete;
     });
+    let resolveBackgrounded!: (info: JobInfo) => void;
+    const backgrounded = new Promise<JobInfo>((complete) => {
+      resolveBackgrounded = complete;
+    });
+    const isSubagent = input.type === 'subagent';
+    const startsImmediately = !isSubagent || this.activeAgents < this.maxConcurrentAgents;
+
     const info: JobInfo = {
       id: input.id,
       type: input.type,
       title: input.title,
-      status: 'running',
+      status: startsImmediately ? 'running' : 'queued',
       startedAt: Date.now(),
       recovery: input.recovery,
     };
     const active: ActiveJob = {
       info,
-      promise: Promise.resolve(info),
+      promise,
+      resolve,
       resolveBackgrounded,
       backgrounded,
       blockingSessions: new Map(),
       isBackgrounded: false,
+      slotHeld: isSubagent && startsImmediately,
+      cancelRequested: false,
+      run: input.run,
+      started: input.started,
+      cancel: input.cancel,
+      settled: input.settled,
     };
+
     this.jobs.set(input.id, active);
 
-    active.promise = Promise.resolve()
-      .then(input.run)
-      .then((output) => this.settle(active, 'completed', output))
-      .catch((error: unknown) =>
-        this.settle(active, 'error', undefined, error instanceof Error ? error.message : String(error)),
-      )
-      .then((settled) => {
-        // A backgrounded job that finishes is kept as a recovery receipt so a
-        // Pi restart can still report what it produced.
-        if (active.isBackgrounded && settled.recovery && settled.notificationId) {
-          this.recoverable.set(settled.notificationId, {
-            jobId: settled.id,
-            notificationId: settled.notificationId,
-            recovery: settled.recovery,
-            status: settled.status,
-            startedAt: settled.startedAt,
-            output: settled.output,
-            error: settled.error,
-          });
-          this.persistRecovery();
-        }
-        input.settled?.(settled);
-        return settled;
-      });
+    if (startsImmediately) {
+      if (active.slotHeld) this.activeAgents++;
+      this.execute(active);
+    } else {
+      this.queue.push(active);
+    }
 
     return info;
   }
@@ -125,7 +160,7 @@ export class JobRegistry {
   async wait(id: string, timeout?: number): Promise<{ info?: JobInfo; timedOut: boolean }> {
     const job = this.jobs.get(id);
     if (!job) return { timedOut: false };
-    if (job.info.status !== 'running') return { info: job.info, timedOut: false };
+    if (!this.isPending(job.info.status)) return { info: job.info, timedOut: false };
     if (timeout === undefined) return { info: await job.promise, timedOut: false };
     if (timeout <= 0) return { info: job.info, timedOut: true };
     let timer: NodeJS.Timeout | undefined;
@@ -139,16 +174,14 @@ export class JobRegistry {
     return result;
   }
 
-  /**
-   * Waits for a job to finish, or returns as soon as it is backgrounded.
-   *
-   * The backgrounded branch matters: a foreground shell that the user moves to
-   * the background must not keep the parent session blocked.
-   */
-  async block(id: string, sessionId: string): Promise<{ type: 'finished' | 'backgrounded'; info: JobInfo } | undefined> {
+  /** Waits until a job finishes or the foreground caller backgrounds it. */
+  async block(
+    id: string,
+    sessionId: string,
+  ): Promise<{ type: 'finished' | 'backgrounded'; info: JobInfo } | undefined> {
     const job = this.jobs.get(id);
     if (!job) return undefined;
-    if (job.info.status !== 'running') {
+    if (!this.isPending(job.info.status)) {
       this.consume(job);
       return { type: 'finished', info: job.info };
     }
@@ -168,9 +201,21 @@ export class JobRegistry {
     }
   }
 
-  /** Backgrounded jobs whose completion has not been delivered yet. */
+  /** All persisted or in-memory background receipts not yet acknowledged. */
   pendingBackground(): Recoverable[] {
     return [...this.recoverable.values()];
+  }
+
+  /** Receipts that should be replayed on session start (scoped to the active parent session when provided). */
+  pendingDeliveries(parentSessionId?: string): Recoverable[] {
+    return [...this.recoverable.values()].filter((item) => {
+      if (parentSessionId && item.recovery.parentSessionId && item.recovery.parentSessionId !== parentSessionId) {
+        return false;
+      }
+      if (this.recovered.has(item.notificationId)) return true;
+      const live = this.jobs.get(item.jobId);
+      return live !== undefined && !this.isPending(live.info.status);
+    });
   }
 
   background(id: string): JobInfo | undefined {
@@ -181,17 +226,7 @@ export class JobRegistry {
     job.blockingSessions.clear();
     if (job.info.recovery) {
       job.info.notificationId ??= randomUUID();
-      if (job.info.status !== 'running') {
-        this.recoverable.set(job.info.notificationId, {
-          jobId: job.info.id,
-          notificationId: job.info.notificationId,
-          recovery: job.info.recovery,
-          status: job.info.status,
-          startedAt: job.info.startedAt,
-          output: job.info.output,
-          error: job.info.error,
-        });
-      }
+      this.recordRecoverable(job.info);
       this.persistRecovery();
     }
     job.resolveBackgrounded(job.info);
@@ -202,7 +237,7 @@ export class JobRegistry {
   backgroundAll(sessionId: string, type?: JobInfo['type']): JobInfo[] {
     const output: JobInfo[] = [];
     for (const job of this.jobs.values()) {
-      if (job.info.status !== 'running' || job.isBackgrounded) continue;
+      if (!this.isPending(job.info.status) || job.isBackgrounded) continue;
       if (type && job.info.type !== type) continue;
       if (!job.blockingSessions.has(sessionId)) continue;
       const info = this.background(job.info.id);
@@ -211,62 +246,200 @@ export class JobRegistry {
     return output;
   }
 
-  async cancelAll(): Promise<JobInfo[]> {
-    const active = [...this.jobs.keys()].filter((id) => this.jobs.get(id)?.info.status === 'running');
-    const items = await Promise.all(active.map((id) => this.cancel(id)));
+  /** Re-attaches a running backgrounded job back to foreground blocking. */
+  reattach(id: string): JobInfo | undefined {
+    const job = this.jobs.get(id);
+    if (!job || !this.isPending(job.info.status) || !job.isBackgrounded) return job?.info;
+    job.isBackgrounded = false;
+    const notificationId = job.info.notificationId;
+    if (notificationId) {
+      job.info.notificationId = undefined;
+      this.recoverable.delete(notificationId);
+      this.recovered.delete(notificationId);
+      this.persistRecovery();
+    }
+    job.backgrounded = new Promise<JobInfo>((complete) => {
+      job.resolveBackgrounded = complete;
+    });
+    return job.info;
+  }
+
+  async cancelAll(reason = 'Pi is shutting down; the job was interrupted.'): Promise<JobInfo[]> {
+    const pendingIds = [...this.jobs.values()]
+      .filter((job) => this.isPending(job.info.status))
+      .map((job) => job.info.id);
+    // Give foreground work the same durable receipt as background work before
+    // interrupting it; otherwise a Pi quit loses its recovery path entirely.
+    for (const id of pendingIds) this.background(id);
+    const items = await Promise.all(pendingIds.map((id) => this.cancel(id, reason)));
     return items.filter((item): item is JobInfo => Boolean(item));
   }
 
-  async cancel(id: string): Promise<JobInfo | undefined> {
+  async cancel(id: string, reason?: string): Promise<JobInfo | undefined> {
     const job = this.jobs.get(id);
     if (!job) return this.get(id);
-    if (job.info.status === 'running') {
-      this.settle(job, 'cancelled');
-      if (job.info.recovery && job.info.notificationId) {
-        this.recoverable.set(job.info.notificationId, {
-          jobId: job.info.id,
-          notificationId: job.info.notificationId,
-          recovery: job.info.recovery,
-          status: 'cancelled',
-          startedAt: job.info.startedAt,
-        });
-        this.persistRecovery();
+    if (!this.isPending(job.info.status)) return job.info;
+
+    job.cancelRequested = true;
+    job.cancelReason = reason ?? 'Cancelled by user.';
+    if (!job.slotHeld) {
+      this.queue = this.queue.filter((item) => item !== job);
+      try {
+        await job.cancel?.();
+      } catch (error) {
+        job.cancelReason = `Cancellation cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
       }
-      void job.promise.catch(() => {});
+      this.finish(job, 'cancelled', undefined, job.cancelReason);
+      this.pump();
+      return job.info;
     }
-    this.consume(job);
-    return job.info;
+
+    try {
+      await job.cancel?.();
+    } catch (error) {
+      job.cancelReason = `Cancellation requested; cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    // Wait for the underlying process/session to settle. Until then the job is
+    // still running and retains its execution slot; it must not be reported as
+    // cancelled while it can still modify files.
+    return await job.promise;
+  }
+
+  /**
+   * Suppresses the automatic background completion notification for a job when
+   * the model explicitly cancels it via `job_cancel` and receives the result
+   * directly in the tool response.
+   */
+  suppressNotification(id: string): void {
+    const job = this.jobs.get(id);
+    const notificationId = job?.info.notificationId;
+    if (notificationId) {
+      job.info.notificationId = undefined;
+      this.recoverable.delete(notificationId);
+      this.recovered.delete(notificationId);
+      this.persistRecovery();
+    }
   }
 
   /**
    * Marks a backgrounded job's completion as delivered.
    *
-   * The job stays in the consumed history so `job_status` can still resolve it
-   * after the notice reached the parent session.
+   * The job stays in consumed history so `job_status` can still resolve it.
+   * `recoveredJob` records work interrupted by the previous Pi process, which
+   * has no live ActiveJob entry to consume.
    */
-  completeBackground(notificationId: string): void {
+  completeBackground(notificationId: string, recoveredJob?: JobInfo): void {
     for (const [id, job] of this.jobs) {
-      if (job.info.notificationId === notificationId && job.info.status !== 'running') {
-        this.recoverable.delete(notificationId);
-        this.persistCompleted(job.info);
-        this.jobs.delete(id);
-        this.persistRecovery();
-        return;
-      }
+      if (job.info.notificationId !== notificationId || this.isPending(job.info.status)) continue;
+      this.recoverable.delete(notificationId);
+      this.recovered.delete(notificationId);
+      this.jobs.delete(id);
+      this.persistCompleted(job.info);
+      this.persistRecovery();
+      return;
     }
     this.recoverable.delete(notificationId);
+    this.recovered.delete(notificationId);
+    if (recoveredJob) this.persistCompleted(recoveredJob);
     this.persistRecovery();
   }
 
-  private settle(job: ActiveJob, status: Exclude<JobStatus, 'running'>, output?: string, error?: string): JobInfo {
-    if (job.info.status !== 'running') return job.info;
+  private execute(job: ActiveJob): void {
+    try {
+      job.started?.(job.info);
+    } catch (error) {
+      if (job.slotHeld) {
+        job.slotHeld = false;
+        this.activeAgents--;
+      }
+      this.finish(job, 'error', undefined, `Could not start job: ${error instanceof Error ? error.message : String(error)}`);
+      this.pump();
+      return;
+    }
+
+    void Promise.resolve()
+      .then(job.run)
+      .then(
+        (output) =>
+          this.finish(
+            job,
+            job.cancelRequested ? 'cancelled' : 'completed',
+            job.cancelRequested ? undefined : output,
+            job.cancelReason,
+          ),
+        (error: unknown) =>
+          this.finish(
+            job,
+            job.cancelRequested ? 'cancelled' : 'error',
+            undefined,
+            job.cancelReason ?? (error instanceof Error ? error.message : String(error)),
+          ),
+      )
+      .finally(() => {
+        if (job.slotHeld) {
+          job.slotHeld = false;
+          this.activeAgents--;
+          job.resolve(job.info);
+          this.pump();
+        } else {
+          job.resolve(job.info);
+        }
+      });
+  }
+
+  private pump(): void {
+    while (this.activeAgents < this.maxConcurrentAgents && this.queue.length > 0) {
+      const job = this.queue.shift()!;
+      if (job.info.status !== 'queued') continue;
+      job.slotHeld = true;
+      this.activeAgents++;
+      job.info.status = 'running';
+      this.execute(job);
+    }
+  }
+
+  private activeCount(): number {
+    return this.activeAgents;
+  }
+
+  private isPending(status: JobStatus): boolean {
+    return status === 'queued' || status === 'running';
+  }
+
+  private finish(
+    job: ActiveJob,
+    status: Exclude<JobStatus, 'queued' | 'running'>,
+    output?: string,
+    error?: string,
+  ): void {
+    if (!this.isPending(job.info.status)) return;
     Object.assign(job.info, {
       status,
       completedAt: Date.now(),
       ...(output !== undefined ? { output } : {}),
       ...(error !== undefined ? { error } : {}),
     });
-    return job.info;
+    if (job.info.recovery && job.info.notificationId && job.isBackgrounded) {
+      this.recordRecoverable(job.info);
+      this.persistRecovery();
+    } else if (job.isBackgrounded && !job.info.notificationId) {
+      this.consume(job);
+    }
+    job.resolve(job.info);
+    job.settled?.(job.info);
+  }
+
+  private recordRecoverable(info: JobInfo): void {
+    if (!info.recovery || !info.notificationId) return;
+    this.recoverable.set(info.notificationId, {
+      jobId: info.id,
+      notificationId: info.notificationId,
+      recovery: info.recovery,
+      status: info.status,
+      startedAt: info.startedAt,
+      output: info.output,
+      error: info.error,
+    });
   }
 
   private persistRecovery(): void {
@@ -285,17 +458,9 @@ export class JobRegistry {
   }
 
   private consume(job: ActiveJob): void {
-    if (job.info.status === 'running') return;
+    if (this.isPending(job.info.status)) return;
     if (job.info.recovery && job.info.notificationId) {
-      this.recoverable.set(job.info.notificationId, {
-        jobId: job.info.id,
-        notificationId: job.info.notificationId,
-        recovery: job.info.recovery,
-        status: job.info.status,
-        startedAt: job.info.startedAt,
-        output: job.info.output,
-        error: job.info.error,
-      });
+      this.recordRecoverable(job.info);
       this.persistRecovery();
     }
     if (this.jobs.delete(job.info.id)) this.persistCompleted(job.info);

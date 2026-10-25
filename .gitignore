@@ -2,5 +2,6 @@ node_modules/
 package-lock.json
 *.log
 .pi/
+subagents/
 .DS_Store
 Thumbs.db
