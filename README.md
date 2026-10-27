@@ -1,188 +1,192 @@
-# pi-agent-orchestrator
+<div align="center">
 
-Background shell jobs and child agents for [Pi](https://github.com/earendil-works/pi), with automatic
-completion notifications and a dock that shows what is running.
+# ⚡ pi-agent-orchestrator
 
-## Why
+**Parallel Subagents, Background Shell Jobs & Interactive Activity Dock for [Pi](https://github.com/earendil-works/pi)**
 
-Pi runs one agent loop at a time. Long builds, test suites, dev servers, and independent
-investigations all compete for that single loop, and a blocking command stalls everything else.
+[![npm version](https://img.shields.io/npm/v/pi-agent-orchestrator?style=flat-square&color=cb3837&logo=npm)](https://www.npmjs.com/package/pi-agent-orchestrator)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](./LICENSE)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.6+-3178c6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Pi Extension](https://img.shields.io/badge/Pi-Extension-10b981?style=flat-square)](https://github.com/earendil-works/pi)
+[![Tests](https://img.shields.io/badge/Tests-60%20passed-22c55e?style=flat-square)](#development)
 
-This package adds a small orchestration layer on top of Pi:
+*Delegate complex exploration, research, coding, and code review to isolated child agents • Run long builds and dev servers in the background without polling • Steer, pause, or inspect everything live in a native TUI dock.*
 
-- work that can run in parallel, does
-- background work reports back on its own instead of being polled
-- delegated work keeps its own context, so the parent stays small
-- everything running is visible in one place
+[**Quick Start**](#-quick-start) · [**Subagent Roles**](#-specialized-subagent-roles) · [**Interactive Lifecycle**](#-interactive-lifecycle--steering) · [**Tools**](#️-tools-reference) · [**Activity Dock**](#️-activity-dock-tui) · [**Architecture Docs**](#-architecture--research-docs)
 
-## Features
+</div>
 
-**Shell execution**
-Runs commands in the foreground by default, or hands them to the background and returns immediately.
-Foreground commands default to a 120-second timeout; background commands have none. Common dev
-servers and watch commands (`npm run dev`, `vite`, `next dev`, `uvicorn`, `tsc --watch`, etc.) are
-automatically promoted to the background after a short startup window so they never block the
-foreground loop until timeout. Output streams to a log file under `.pi/shells/` as it arrives, and
-inline results use head-tail truncation (preserving both startup output and the final summary/error
-lines) so a noisy build cannot flood the context window. `shell_output` supports both positive byte
-offsets and negative offsets (to tail the end of a log file). Exit code, signal, and timeout are
-reported as distinct outcomes rather than collapsed into "failed".
+---
 
-**Child agents**
-Delegates a task to an agent with its own context. Every child session inherits Pi's built-in tools
-(including `codemode` via `createCodemodeExtension()`) plus callable tools from the parent session
-(`ctx.tools`, such as `web_search`, `fetch_content`, MCP tools, etc.), and then applies a role-specific
-exclusion list (`AGENT_EXCLUDED_TOOLS` / `excludeTools`) so orchestrator/interactive tools (`subagent`,
-`shell`, `job_*`, `ask_user_question`) are never exposed to children and write/destructive tools are
-excluded from read-only roles. Five roles are available:
+## ✨ Why `pi-agent-orchestrator`?
 
-- `explore` — fast codebase search specialist. Excludes `edit` and `write`, and guards `bash` to
-  read-only commands.
-- `code` — focused implementation and verification specialist with the full coding tool set (`read`,
-  `grep`, `find`, `ls`, `bash`, `edit`, `write`, `codemode`, plus inherited parent tools).
-- `review` — standalone read-only code and diff reviewer. Audits repository state, diffs, and test
-  coverage, reporting concrete findings with `file:line` evidence and severity.
-- `research` — read-only deep researcher. Investigates external docs, libraries, and GitHub
-  repositories (via read-only `gh` CLI commands and inherited web/MCP tools) alongside local
-  codebase context.
-- `general` — multi-step work with the full coding tool set (`read`, `grep`, `find`, `ls`, `bash`,
-  `edit`, `write`, `codemode`, plus inherited parent tools) using Pi's default system prompt.
+By default, an AI coding agent runs a single synchronous loop: a long test suite, a dev server, or a 40-file codebase search blocks the conversation and floods the main context window with raw tool output.
 
-Child conversations are real Pi session files linked to their parent, so passing the returned
-`sessionID` resumes the same conversation — including after restarting Pi. For significant `code` or
-`general` coding tasks, set `review: true` to request an independent read-only review of the task
-criteria, repository changes, and observed verification commands. A concrete review finding allows
-one focused fix and one re-review at most. Review is opt-in, costs an extra agent run, and fails
-closed: missing or failed recognized verification evidence, an uncertain review, or unresolved
-findings do not return an approved result. It does not replace running the project's required checks.
+`pi-agent-orchestrator` adds a native multi-agent and background-execution layer on top of Pi:
 
-**Read-only guard**
-Read-only agents (`explore`, `review`, `research`) exclude `edit` and `write` from their tool schema
-and install `createReadOnlyGuard()` on Pi's `tool_call` hook so any direct `write` or `edit` call is
-blocked before it runs, while `bash` remains unrestricted for repository inspection (`git -C ...`,
-`find`, `rg`, pipelines, etc.) under the child's read-only system prompt. The guard applies to the
-child session only; the parent session keeps its full tool set.
+- **🚀 True Parallelism**: Spawn up to **10 concurrent subagents** (`@explore`, `@code`, `@review`, `@research`, `@general`) in a single turn.
+- **🧠 Context Isolation**: Each child agent runs in its own isolated Pi session with role-tailored prompts and tools, returning a distilled report + ground-truth `<telemetry>` to keep the parent context lean.
+- **⚡ Zero-Latency Interactivity**:
+  - **Send a message (`Enter`)** while subagents or `job_wait` are running $\to$ work is **automatically backgrounded** so the Main Agent replies to you immediately without losing subagent progress.
+  - **Press `Esc`** $\to$ stops both the Main Agent and any active subagents immediately while preserving their `sessionID` so saying **`continue`** resumes right where they left off.
+  - **Live Mid-Run Steering** $\to$ inject new instructions into an already-running subagent via `subagent({ sessionID, prompt })` without restarting it.
+- **🔔 Push Completion Notices (No Polling)**: Background shells and subagents automatically wake the parent session via steering messages when they finish.
+- **🛡️ Fail-Closed Review Gate (`review: true`)**: Optional independent reviewer audits code changes against task criteria, mid-run steering updates, and verified test execution before accepting delivery.
 
-**Bounded queue and delivery recovery**
-Up to four jobs execute at once by default; additional work is shown as `Queued`. Cancelling a queued
-job prevents it from starting. Cancelling a running job asks Pi's shell or child session to stop and
-waits for the operation to settle before reusing its slot. Completion receipts remain in session
-state until `sendMessage` accepts them. On process shutdown, unfinished jobs are persisted as
-interrupted and reported in the next session; session switches within the same Pi process preserve
-live background jobs.
+---
 
-**Job lifecycle**
-Every command and child agent becomes a job that can be inspected, waited on, moved to the
-background, or cancelled. Interrupted work leaves a receipt instead of vanishing silently.
+## 📦 Quick Start
 
-**Completion notifications**
-Background work wakes the parent session when it finishes. Polling is unnecessary, and the tool
-descriptions and receipts say so explicitly.
-
-**Activity dock**
-A compact `Subagents` / `Shell` view, plus a full-screen detail with expandable Thought and Explored
-groups, tool history, mouse-wheel scrolling, and interruption. The dock uses the active Pi theme, so
-it follows the terminal's colors.
-
-## Usage
-
-Press `↓` with an empty editor — and no active overlay, autocomplete, or history browsing — to open
-the dock, or run `/agents`.
-
-| Key | Action |
-|---|---|
-| `↑` / `↓` | Move the selection |
-| `←` / `→` | Switch between Subagents and Shell |
-| `Enter` | Open the detail view |
-| `Esc` | Close the dock, or return from detail |
-
-Arrow keys stay with Pi whenever you are typing, browsing history or autocomplete, or using a
-selector, so nothing is taken away from normal editing.
-
-In the detail view, `Esc` or `←` returns to the list, the mouse wheel scrolls, and Thought/Explored
-groups toggle on click.
-
-### Tools
-
-| Tool | Purpose |
-|---|---|
-| `shell` | Run a command, foreground or background |
-| `subagent` | Delegate to `explore`, `code`, `review`, `research`, or `general`; continue with `sessionID` |
-| `job_status` | Inspect a job |
-| `job_wait` | Block until a job finishes, with an optional timeout |
-| `job_background` | Move a foreground job to the background |
-| `job_cancel` | Cancel a job |
-| `shell_output` | Read a bounded range of a shell's output |
-
-## Defaults
-
-- Foreground `shell` timeout: **120,000 ms**. Background runs: no timeout unless one is passed.
-- At most **10** child subagents execute at once by default. Additional subagents are queued and
-  shown as `Queued`; cancelling a queued subagent removes it before it starts.
-- Shell commands (foreground and background) have **no concurrency limit** and run without queueing.
-- Cancelling a running subagent or command waits until the underlying session or process has actually
-  stopped before its execution slot is reused.
-- Subagent nesting depth: **1**. A child session does not load extensions, so it cannot spawn
-  another child.
-- A background launch returns a receipt with its ID and an instruction not to poll.
-- `general` uses Pi's own system prompt; it is not overridden.
-
-## Design notes
-
-**Native Pi APIs only.** The package uses Pi's own `createAgentSession`, `SessionManager`,
-`DefaultResourceLoader`, `createLocalBashOperations`, and `Theme`. Child sessions are created with
-`noExtensions: true` so the orchestrator is not loaded twice, and they get Pi's own tool names
-(`read`, `grep`, `find`, `ls`, `bash`, `edit`, `write`). The read-only guard is an inline extension
-that uses Pi's `tool_call` hook.
-
-**Durable children, process-local jobs.** Child sessions are real session files linked to their
-parent, so they survive a restart. Running OS processes and live agent runtimes do not: they belong
-to the Pi process that started them. On shutdown, unfinished jobs are persisted as interrupted receipts and reported on the next
-session start rather than pretending they finished. A receipt is removed only after Pi accepts the
-completion message. Session switches within the same Pi process preserve running background jobs
-and their completion receipts.
-
-**Completion over polling.** Every background path delivers a message back to the parent session.
-The tool descriptions, receipts, and recovery notices all say the same thing, because polling
-wastes turns and tokens.
-
-**Arrows belong to the editor.** The dock never takes a global key. It opens only from an empty
-editor, and the guard is checked at input time so overlays, autocomplete, history browsing, and
-selectors keep working normally.
-
-## Documentation
-
-Detailed technical documentation, empirical benchmarks, architecture diagrams, and failure-mode analyses are available in [`docs/`](./docs):
-
-1. [**01 — Problem Statement, Failure Taxonomy & Empirical Research**](./docs/01-problem-and-research.md): Quantitative findings from MAST (NeurIPS 2025, 1,600+ traces), Anthropic Multi-Agent Research (+90.2% gain, BrowseComp 80% token-variance analysis), OpenDev (arXiv:2603.05344), Task Spec Contracts (31% $\to$ 7% scope-error reduction), and production post-mortems.
-2. [**02 — System Architecture & Pi Harness Integration**](./docs/02-architecture-and-pi-harness.md): Component diagrams, `DefaultResourceLoader` isolation, `createCodemodeExtension()` integration, Inherit-All + Role Denylist tool resolution (`resolveChildTools`), and durable `SessionManager` linkage.
-3. [**03 — Subagent Roles, Handoff Protocol & Verification Gate**](./docs/03-subagent-roles-and-handoff-protocol.md): Capability matrix for `explore`, `research`, `code`, `review`, and `general`; the 4-stage reliable handoff protocol (`expectedOutput`, `EMPTY_COMPLETION_NUDGE`, `<telemetry>` receipts, `sessionID` continuation); `createReadOnlyGuard()`; and the fail-closed `review: true` gate.
-4. [**04 — Background Jobs, Shell Pipeline & Crash Recovery**](./docs/04-background-jobs-and-shell-engine.md): `JobRegistry` state machine, 32 KB Head-Tail truncation, automatic dev-server promotion (`isServerCommand`), negative-offset tail reads, and session-scoped durable recovery (`pi-agent-orchestrator.recovery.v1`).
-5. [**05 — TUI Activity Dock & The 4-Phase Engineering Workflow**](./docs/05-tui-activity-dock-and-workflows.md): Main-session-matched TUI rendering (`Markdown`, `ThinkingSection`, `ToolExecutionBox`) and integration with the 4 Pi skills (`grill-me`, `plan`, `execute`, `verify`).
-
-## Development
-
-```bash
-npm install   # dev-only: typescript, @types/node, jiti
-npm run typecheck
-npm test
-```
-
-`npm test` runs `node --test` over `tests/`. It covers the job lifecycle, the editor-key guard, shell
-result formatting, and the opt-in review gate. Tests are development-only and are not published.
-
-## Install
+Install directly via Pi's package manager:
 
 ```bash
 pi install npm:pi-agent-orchestrator
 ```
 
-Or from a local checkout:
+Or install from a local checkout during development:
 
 ```bash
 pi install ./path/to/pi-agent-orchestrator
 ```
 
-## License
+---
 
-MIT © 2026 tungbach12.
+## 🤖 Specialized Subagent Roles
+
+Every child session inherits Pi's built-in tools (including `codemode`), plus callable parent tools (`web_search`, `fetch_content`, MCP tools, etc.), filtered through a strict role-based capability matrix:
+
+| Role | Mode | Built-in & Inherited Tools | `review: true` Gate | Primary Use Case |
+| :--- | :---: | :--- | :---: | :--- |
+| **`@explore`** | 🔒 Read-Only | `read`, `grep`, `find`, `ls`, `bash`, `codemode` + read-only parent tools | — | Fast, parallel codebase navigation and symbol/file discovery |
+| **`@research`** | 🔒 Read-Only | `read`, `grep`, `find`, `ls`, `bash`, `codemode` + `web_search`, `fetch_content`, `gh` CLI | — | Deep technical research across external docs, GitHub repos, and local code |
+| **`@review`** | 🔒 Read-Only | `read`, `grep`, `find`, `ls`, `bash`, `codemode` + read-only parent tools | — | Senior code & diff auditing with severity-ranked `file:line` findings |
+| **`@code`** | ✍️ Read/Write | Full coding toolset (`read`, `grep`, `find`, `ls`, `bash`, `edit`, `write`, `codemode`) + parent tools | ✅ Supported | Scoped feature implementation, bug fixing, and test verification |
+| **`@general`** | ✍️ Read/Write | Full coding toolset + parent tools (uses Pi's default system prompt) | ✅ Supported | Open-ended multi-step workflows requiring full tool access |
+
+### Built-in Safety & Reliability Guardrails
+
+- **Two-Layer Read-Only Guard (`createReadOnlyGuard`)**: `@explore`, `@review`, and `@research` exclude `edit` and `write` from their tool schema and enforce a runtime `tool_call` hook blocking file modifications, while leaving `bash` unrestricted for complex multi-repo inspection (`cd repo && git status`, `find`, `rg`).
+- **Default Child `bash` Timeout**: Child `bash` calls automatically default to a **120-second timeout** when omitted, preventing runaway filesystem scans (e.g. `find /`) from hanging a subagent indefinitely.
+- **4-Stage Handoff Protocol**:
+  1. **`expectedOutput` Contract**: Appended to the end of the child prompt for recency focus.
+  2. **One-Shot Empty-Completion Nudge**: Automatically recovers if a child executes tools but forgets to emit a final synthesis turn.
+  3. **Ground-Truth `<telemetry>`**: Every `<subagent>` completion envelope includes exact tool call counts, modified files, executed commands, and verification status.
+  4. **Durable `sessionID` Continuation**: Child sessions are stored under `<parent-session-dir>/subagents/*.jsonl` (hidden from `/resume` clutter) and can be resumed across turns or Pi restarts.
+
+---
+
+## 🔄 Interactive Lifecycle & Steering
+
+```text
+User Input / Key          Main Agent State               Subagent / Job Behavior
+──────────────────────────────────────────────────────────────────────────────────────────────────
+Enter (send message)  ──► Unblocks immediately       ──► Auto-backgrounds active subagents &
+                          to answer your message         interrupts job_wait (jobs keep running)
+
+Esc (cancel turn)     ──► Aborts current turn        ──► Aborts active subagents & preserves
+                                                         sessionID for instant "continue" resume
+
+"continue" / "tiếp"   ──► Sees <interrupted_subagents> ─► Calls subagent({ sessionID }) to resume
+                          system notice                  from existing tool & message history
+
+Steer running agent   ──► Calls subagent({ sessionID, ──► Injects live steering prompt into the
+                          prompt: "<new guidance>" })    running child session without aborting
+```
+
+### Independent Verification Gate (`review: true`)
+
+When `review: true` is passed to a `@code` or `@general` subagent:
+1. The implementer completes its changes and runs project verification commands (`npm test`, `./mvnw test`, `pytest`, `cargo test`, `tsc --noEmit`, `git diff --check`, etc., including multi-repo `cd <repo> && ...` chains).
+2. An isolated read-only `@review` agent audits the repository state against both the original task prompt **and** any mid-run steering instructions.
+3. If the reviewer returns `NEEDS_FIX`, the implementer is resumed **at most once** to fix the concrete findings and re-run verification before a final re-review.
+4. Fails closed if no verification command succeeded or if findings remain unresolved (while always preserving the implementer's full report for inspection).
+
+---
+
+## 🛠️ Tools Reference
+
+All job management tools (`job_wait`, `job_status`, `job_background`, `job_cancel`) accept **either** the exact `UUID` **or** the human-readable subagent `description` / job `title` (exact or substring match).
+
+| Tool | Parameters | Description |
+| :--- | :--- | :--- |
+| **`subagent`** | `agent`, `description`, `prompt`, `expectedOutput?`, `sessionID?`, `background?`, `review?`, `model?` | Spawn a new child agent (`explore`, `code`, `review`, `research`, `general`), resume a previous child session, or steer a running one via `sessionID`. |
+| **`shell`** | `command`, `workdir?`, `timeout?`, `background?` | Execute a shell command. Streams full output to `.pi/shells/<id>.log`, auto-backgrounds persistent dev servers (`vite`, `next dev`, `npm run dev`, etc.) after startup, and applies 32 KB head-tail truncation inline. |
+| **`shell_output`** | `shellID`, `offset?`, `limit?` | Read a byte range from a shell log file. Supports negative `offset` (e.g. `-8192`) to tail the latest output. |
+| **`job_wait`** | `id`, `timeout?` | Wait for a queued or running job (by UUID or description/title). Automatically unblocks if the user sends a message or presses `Esc`. |
+| **`job_status`** | `id` | Inspect the current status, timing, and output of a shell or subagent job (by UUID or description/title). |
+| **`job_background`** | `id` | Move a running foreground job to the background. |
+| **`job_cancel`** | `id` | Cancel a queued or running shell/subagent job and wait for its process/session to settle. |
+
+---
+
+## 🖥️ Activity Dock (TUI)
+
+Press **`↓` (Down Arrow)** from an empty editor (or run **`/agents`**) to open the live Activity Dock overlay:
+
+```text
+╭─ Activity · Subagents (2) · Shell (1) ──────────────────────────────────────────────────────────╮
+│ ● @explore  Explore existing docs and templates                       18 tools · 14s · running  │
+│ ✓ @code     Implement backend finding query endpoint                  12 tools · 42s · done     │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ ↑/↓ select · ←/→ switch tab · Enter inspect transcript · x cancel job · Esc close               │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+### Keyboard & Mouse Controls
+
+| Key / Input | Context | Action |
+| :--- | :--- | :--- |
+| **`↓`** *(empty editor)* or **`/agents`** | Main Editor | Open the Activity Dock |
+| **`↑` / `↓`** | Dock List | Select subagent or shell job |
+| **`←` / `→`** | Dock List | Switch between **Subagents** and **Shell** tabs |
+| **`Enter`** | Dock List | Open full-screen **Detail View** for the selected item |
+| **`Mouse Wheel`** / **`↑` / `↓`** | Detail View | Smooth, cached sub-millisecond scrolling through large transcripts |
+| **`Click`** / **`Enter`** | Detail View | Expand or collapse **Thought** and **Explored** tool groups |
+| **`x`** | List / Detail | Cancel the selected running job |
+| **`Esc`** / **`←`** | Detail / List | Return to list or close the Activity Dock |
+
+---
+
+## ⚙️ Runtime Defaults
+
+| Setting | Default | Notes |
+| :--- | :--- | :--- |
+| **Max Concurrent Subagents** | `10` | Additional subagents enter `queued` state and start automatically as slots free up |
+| **Shell Concurrency** | Unlimited | Foreground and background shell commands never consume subagent slots |
+| **Foreground Shell Timeout** | `120,000 ms` | Background shell runs have no timeout unless explicitly specified |
+| **Child `bash` Timeout** | `120 s` | Applied automatically when a child session calls `bash` without a `timeout` |
+| **Inline Output Budget** | `32 KB` (`shell`) / `40K chars` (`subagent`) | Uses head-tail truncation so startup context and final errors/summaries are both preserved |
+| **Max Subagent Nesting Depth** | `1` | Child sessions run with `noExtensions: true` and cannot recursively spawn subagents |
+
+---
+
+## 📚 Architecture & Research Docs
+
+Deep-dive engineering documentation, empirical benchmarks, and failure-mode analyses are available in [`docs/`](./docs):
+
+1. [**01 — Problem Statement, Failure Taxonomy & Empirical Research**](./docs/01-problem-and-research.md)
+   *Quantitative findings from MAST (NeurIPS 2025), Anthropic Multi-Agent Research (+90.2% gain, BrowseComp token-variance analysis), OpenDev, and Task Spec Contracts.*
+2. [**02 — System Architecture & Pi Harness Integration**](./docs/02-architecture-and-pi-harness.md)
+   *Component diagrams, `DefaultResourceLoader` isolation, `createCodemodeExtension()` integration, Inherit-All + Role Denylist tool resolution (`resolveChildTools`), and durable `SessionManager` linkage.*
+3. [**03 — Subagent Roles, Handoff Protocol & Verification Gate**](./docs/03-subagent-roles-and-handoff-protocol.md)
+   *Capability matrix for `explore`, `research`, `code`, `review`, and `general`; the 4-stage handoff protocol; `createReadOnlyGuard()`; and the fail-closed `review: true` gate.*
+4. [**04 — Background Jobs, Shell Pipeline & Crash Recovery**](./docs/04-background-jobs-and-shell-engine.md)
+   *`JobRegistry` state machine, 32 KB Head-Tail truncation, automatic dev-server promotion (`isServerCommand`), negative-offset tail reads, and session-scoped durable recovery (`pi-agent-orchestrator.recovery.v1`).*
+5. [**05 — TUI Activity Dock & The 4-Phase Engineering Workflow**](./docs/05-tui-activity-dock-and-workflows.md)
+   *Cached sub-millisecond TUI rendering (`Markdown`, `ThinkingSection`, `ToolExecutionBox`) and integration with structured engineering workflows (`grill-me` $\to$ `plan` $\to$ `execute` $\to$ `verify`).*
+
+---
+
+## 🧪 Development
+
+```bash
+npm install          # Installs devDependencies (typescript, @types/node, jiti)
+npm run typecheck    # Runs tsc --noEmit
+npm test             # Runs all 60 unit & integration tests via node --test
+```
+
+---
+
+## 📄 License
+
+[MIT](./LICENSE) © 2026 [tungbach12](https://github.com/tungbach12)
