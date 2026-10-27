@@ -184,13 +184,19 @@ export const SubagentParams = Type.Object({
   review: Type.Optional(Type.Boolean({ description: 'For a "code" or "general" coding task, run one independent read-only review against this task after implementation. If review finds concrete gaps, allow one bounded fix and re-review. Adds latency and token cost; does not replace running the required tests.' })),
 });
 
-export const JobStatusParams = Type.Object({ id: Type.String({ description: 'Job or shell ID.' }) });
+export const JobStatusParams = Type.Object({
+  id: Type.String({ description: 'Job ID, shell ID, or subagent description/title.' }),
+});
 export const JobWaitParams = Type.Object({
-  id: Type.String({ description: 'Job or shell ID.' }),
+  id: Type.String({ description: 'Job ID, shell ID, or subagent description/title.' }),
   timeout: Type.Optional(Type.Number({ description: 'Optional timeout in milliseconds.' })),
 });
-export const JobBackgroundParams = Type.Object({ id: Type.String({ description: 'Job ID to move to background.' }) });
-export const JobCancelParams = Type.Object({ id: Type.String({ description: 'Job ID to cancel.' }) });
+export const JobBackgroundParams = Type.Object({
+  id: Type.String({ description: 'Job ID, shell ID, or subagent description/title to move to background.' }),
+});
+export const JobCancelParams = Type.Object({
+  id: Type.String({ description: 'Job ID, shell ID, or subagent description/title to cancel.' }),
+});
 export const ShellOutputParams = Type.Object({
   shellID: Type.String({ description: 'Shell ID returned by the shell tool.' }),
   offset: Type.Optional(Type.Number({ description: 'Starting byte offset (non-negative from start of log, or negative such as -8192 to read from the end of the log).' })),

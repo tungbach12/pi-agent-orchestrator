@@ -42,13 +42,13 @@ test('mutating lint and snapshot-update commands are not recognized as verificat
     'npx eslint . --fix',
     'npx vitest run -u',
     'npx vitest run --update',
-    'npm test && npm run build',
     'npm test > test.log',
     'cargo fmt',
     'dart format lib/',
     'ruff format .',
     'npx prettier .',
     'npx tsc',
+    'cd repo && rm -rf dist && npm test',
   ]) {
     assert.equal(
       verificationEvidence([{ name: 'bash', input: { command }, status: 'completed', output: 'done' }]).hasSuccessfulCheck,
@@ -58,7 +58,7 @@ test('mutating lint and snapshot-update commands are not recognized as verificat
   }
 });
 
-test('read-only formatting checks are recognized as verification evidence', () => {
+test('read-only formatting checks and multi-repo chained verification commands are recognized as verification evidence', () => {
   for (const command of [
     'cargo fmt --check',
     'cargo fmt -- --check',
@@ -72,6 +72,11 @@ test('read-only formatting checks are recognized as verification evidence', () =
     'python3 -m unittest',
     'dotnet test',
     'make test',
+    'git diff --check',
+    'cd /e/Dev/Repos/Capstone/.pi/merge-checkouts/local-frontend-integration && npm test -- --run src/app/layouts/AppShell.test.tsx',
+    'cd /e/Dev/Repos/Capstone/.pi/merge-checkouts/local-frontend-integration && npm run lint && npm test -- --run && npm run build',
+    'cd /e/Dev/Repos/Capstone/.pi/merge-checkouts/local-backend-integration && ./mvnw.cmd spotless:apply && ./mvnw.cmd verify && git diff --check',
+    'cd SmartDroneInspection-mobile && flutter analyze && flutter test',
   ]) {
     assert.equal(
       verificationEvidence([{ name: 'bash', input: { command }, status: 'completed', exitCode: 0, output: 'ok' }]).hasSuccessfulCheck,

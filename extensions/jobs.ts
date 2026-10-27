@@ -25,6 +25,7 @@ interface ActiveJob {
   resolveBackgrounded: (info: JobInfo) => void;
   backgrounded: Promise<JobInfo>;
   blockingSessions: Map<string, number>;
+  waitingSessions: Map<string, Set<() => void>>;
   isBackgrounded: boolean;
   slotHeld: boolean;
   cancelRequested: boolean;
@@ -98,8 +99,32 @@ export class JobRegistry {
     this.consumed = [...consumed.values()].slice(-CONSUMED_LIMIT);
   }
 
+  /** Resolves a job ID from either an exact ID or a job title/description. */
+  resolveId(idOrTitle: string): string {
+    if (this.jobs.has(idOrTitle) || this.consumed.some((job) => job.id === idOrTitle)) {
+      return idOrTitle;
+    }
+    const needle = idOrTitle.trim().toLowerCase();
+    if (!needle) return idOrTitle;
+
+    const active = [...this.jobs.values()].sort((a, b) => b.info.startedAt - a.info.startedAt);
+    const activeExact = active.find((job) => job.info.title.trim().toLowerCase() === needle);
+    if (activeExact) return activeExact.info.id;
+    const activeSub = active.find((job) => job.info.title.toLowerCase().includes(needle));
+    if (activeSub) return activeSub.info.id;
+
+    const recent = [...this.consumed].reverse();
+    const recentExact = recent.find((job) => job.title.trim().toLowerCase() === needle);
+    if (recentExact) return recentExact.id;
+    const recentSub = recent.find((job) => job.title.toLowerCase().includes(needle));
+    if (recentSub) return recentSub.id;
+
+    return idOrTitle;
+  }
+
   get(id: string): JobInfo | undefined {
-    return this.jobs.get(id)?.info ?? this.consumed.find((job) => job.id === id);
+    const resolvedId = this.resolveId(id);
+    return this.jobs.get(resolvedId)?.info ?? this.consumed.find((job) => job.id === resolvedId);
   }
 
   list(): JobInfo[] {
@@ -136,6 +161,7 @@ export class JobRegistry {
       resolveBackgrounded,
       backgrounded,
       blockingSessions: new Map(),
+      waitingSessions: new Map(),
       isBackgrounded: false,
       slotHeld: isSubagent && startsImmediately,
       cancelRequested: false,
@@ -157,21 +183,76 @@ export class JobRegistry {
     return info;
   }
 
-  async wait(id: string, timeout?: number): Promise<{ info?: JobInfo; timedOut: boolean }> {
-    const job = this.jobs.get(id);
-    if (!job) return { timedOut: false };
+  async wait(
+    id: string,
+    timeout?: number,
+    options?: { sessionId?: string; signal?: AbortSignal },
+  ): Promise<{ info?: JobInfo; timedOut: boolean; backgrounded?: boolean; aborted?: boolean }> {
+    const resolvedId = this.resolveId(id);
+    const job = this.jobs.get(resolvedId);
+    if (!job) {
+      const consumed = this.consumed.find((item) => item.id === resolvedId);
+      return consumed ? { info: consumed, timedOut: false } : { timedOut: false };
+    }
     if (!this.isPending(job.info.status)) return { info: job.info, timedOut: false };
-    if (timeout === undefined) return { info: await job.promise, timedOut: false };
-    if (timeout <= 0) return { info: job.info, timedOut: true };
+    if (options?.signal?.aborted) return { info: job.info, timedOut: true, aborted: true };
+    if (timeout !== undefined && timeout <= 0) return { info: job.info, timedOut: true };
+
     let timer: NodeJS.Timeout | undefined;
-    const result = await Promise.race([
-      job.promise.then((info) => ({ info, timedOut: false as const })),
-      new Promise<{ info: JobInfo; timedOut: true }>((resolve) => {
-        timer = setTimeout(() => resolve({ info: job.info, timedOut: true }), timeout);
-      }),
-    ]);
-    if (timer) clearTimeout(timer);
-    return result;
+    let onAbort: (() => void) | undefined;
+    let onBackgrounded: (() => void) | undefined;
+    const sessionId = options?.sessionId;
+
+    const racers: Array<
+      Promise<{ info: JobInfo; timedOut: boolean; backgrounded?: boolean; aborted?: boolean }>
+    > = [job.promise.then((info) => ({ info, timedOut: false as const }))];
+
+    if (timeout !== undefined) {
+      racers.push(
+        new Promise<{ info: JobInfo; timedOut: true }>((resolve) => {
+          timer = setTimeout(() => resolve({ info: job.info, timedOut: true }), timeout);
+        }),
+      );
+    }
+    if (options?.signal) {
+      const sig = options.signal;
+      racers.push(
+        new Promise<{ info: JobInfo; timedOut: true; aborted: true }>((resolve) => {
+          onAbort = () => resolve({ info: job.info, timedOut: true, aborted: true });
+          if (sig.aborted) onAbort();
+          else sig.addEventListener('abort', onAbort, { once: true });
+        }),
+      );
+    }
+    if (sessionId) {
+      racers.push(
+        new Promise<{ info: JobInfo; timedOut: true; backgrounded: true }>((resolve) => {
+          onBackgrounded = () => resolve({ info: job.info, timedOut: true, backgrounded: true });
+          let set = job.waitingSessions.get(sessionId);
+          if (!set) {
+            set = new Set();
+            job.waitingSessions.set(sessionId, set);
+          }
+          set.add(onBackgrounded);
+        }),
+      );
+    }
+
+    try {
+      return await Promise.race(racers);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (onAbort && options?.signal) {
+        options.signal.removeEventListener('abort', onAbort);
+      }
+      if (sessionId && onBackgrounded) {
+        const set = job.waitingSessions.get(sessionId);
+        if (set) {
+          set.delete(onBackgrounded);
+          if (set.size === 0) job.waitingSessions.delete(sessionId);
+        }
+      }
+    }
   }
 
   /** Waits until a job finishes or the foreground caller backgrounds it. */
@@ -219,7 +300,8 @@ export class JobRegistry {
   }
 
   background(id: string): JobInfo | undefined {
-    const job = this.jobs.get(id);
+    const resolvedId = this.resolveId(id);
+    const job = this.jobs.get(resolvedId);
     if (!job) return undefined;
     if (job.isBackgrounded) return job.info;
     job.isBackgrounded = true;
@@ -233,14 +315,22 @@ export class JobRegistry {
     return job.info;
   }
 
-  /** Moves every job the given session is blocking into the background. */
+  /** Moves every job the given session is blocking or waiting on into the background. */
   backgroundAll(sessionId: string, type?: JobInfo['type']): JobInfo[] {
     const output: JobInfo[] = [];
     for (const job of this.jobs.values()) {
-      if (!this.isPending(job.info.status) || job.isBackgrounded) continue;
+      if (!this.isPending(job.info.status)) continue;
       if (type && job.info.type !== type) continue;
-      if (!job.blockingSessions.has(sessionId)) continue;
+      const isBlocking = !job.isBackgrounded && job.blockingSessions.has(sessionId);
+      const waiters = job.waitingSessions.get(sessionId);
+      const isWaiting = Boolean(waiters && waiters.size > 0);
+      if (!isBlocking && !isWaiting) continue;
       const info = this.background(job.info.id);
+      if (waiters) {
+        const callbacks = [...waiters];
+        job.waitingSessions.delete(sessionId);
+        for (const cb of callbacks) cb();
+      }
       if (info) output.push(info);
     }
     return output;
@@ -248,7 +338,8 @@ export class JobRegistry {
 
   /** Re-attaches a running backgrounded job back to foreground blocking. */
   reattach(id: string): JobInfo | undefined {
-    const job = this.jobs.get(id);
+    const resolvedId = this.resolveId(id);
+    const job = this.jobs.get(resolvedId);
     if (!job || !this.isPending(job.info.status) || !job.isBackgrounded) return job?.info;
     job.isBackgrounded = false;
     const notificationId = job.info.notificationId;
@@ -276,8 +367,9 @@ export class JobRegistry {
   }
 
   async cancel(id: string, reason?: string): Promise<JobInfo | undefined> {
-    const job = this.jobs.get(id);
-    if (!job) return this.get(id);
+    const resolvedId = this.resolveId(id);
+    const job = this.jobs.get(resolvedId);
+    if (!job) return this.get(resolvedId);
     if (!this.isPending(job.info.status)) return job.info;
 
     job.cancelRequested = true;
@@ -311,7 +403,8 @@ export class JobRegistry {
    * directly in the tool response.
    */
   suppressNotification(id: string): void {
-    const job = this.jobs.get(id);
+    const resolvedId = this.resolveId(id);
+    const job = this.jobs.get(resolvedId);
     const notificationId = job?.info.notificationId;
     if (notificationId) {
       job.info.notificationId = undefined;
@@ -419,7 +512,15 @@ export class JobRegistry {
       ...(output !== undefined ? { output } : {}),
       ...(error !== undefined ? { error } : {}),
     });
-    if (job.info.recovery && job.info.notificationId && job.isBackgrounded) {
+    if (job.waitingSessions.size > 0) {
+      const notificationId = job.info.notificationId;
+      if (notificationId) {
+        job.info.notificationId = undefined;
+        this.recoverable.delete(notificationId);
+        this.recovered.delete(notificationId);
+      }
+      this.consume(job);
+    } else if (job.info.recovery && job.info.notificationId && job.isBackgrounded) {
       this.recordRecoverable(job.info);
       this.persistRecovery();
     } else if (job.isBackgrounded && !job.info.notificationId) {

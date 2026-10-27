@@ -295,10 +295,10 @@ export default function agentOrchestrator(pi: ExtensionAPI): void {
     const text = event.text.trim();
     if (!text || text.startsWith('/') || text.startsWith('!')) return undefined;
     const activeSessionId = current.sessionManager.getSessionId();
-    // Move any foreground-blocking subagents to the background immediately when
-    // the user sends a message during streaming, so the Main Agent can respond
-    // right away without aborting the subagents' in-flight work.
-    jobs.backgroundAll(activeSessionId, 'subagent');
+    // Move any foreground-blocking work (subagent, shell, or active job_wait) to
+    // the background immediately when the user sends a message during streaming,
+    // so the Main Agent can respond right away without aborting in-flight work.
+    jobs.backgroundAll(activeSessionId);
     return undefined;
   });
 
@@ -523,16 +523,84 @@ export default function agentOrchestrator(pi: ExtensionAPI): void {
     },
   });
 
+  function renderJobCallLabel(toolName: string, idOrTitle: string | undefined, theme: Theme): Text {
+    const raw = idOrTitle ?? '';
+    const resolvedId = raw ? jobs.resolveId(raw) : '';
+    const child = (resolvedId ? subagents.get(resolvedId) : undefined) ?? (raw ? subagents.get(raw) : undefined);
+    const job = resolvedId ? jobs.get(resolvedId) : undefined;
+    const shell = resolvedId ? shellManager.get(resolvedId) : undefined;
+
+    if (child || job?.recovery?.kind === 'subagent' || job?.type === 'subagent') {
+      const agent = child?.agent ?? (job?.recovery?.kind === 'subagent' ? job.recovery.agent : undefined);
+      const title =
+        child?.description ??
+        job?.title ??
+        (job?.recovery?.kind === 'subagent' ? job.recovery.description : undefined) ??
+        raw;
+      const agentPart = agent ? `${theme.fg('accent', `@${agent}`)} ` : '';
+      return new Text(
+        `${theme.fg('toolTitle', theme.bold(toolName))} ${agentPart}${theme.fg('toolOutput', title)}`,
+        0,
+        0,
+      );
+    }
+
+    if (shell || job?.type === 'shell') {
+      const command = shell?.command ?? job?.title ?? raw;
+      return new Text(
+        `${theme.fg('toolTitle', theme.bold(toolName))} ${theme.fg('accent', 'shell')} ${theme.fg('toolOutput', command)}`,
+        0,
+        0,
+      );
+    }
+
+    return new Text(`${theme.fg('toolTitle', theme.bold(toolName))} ${theme.fg('toolOutput', raw)}`, 0, 0);
+  }
+
+  function renderJobStatusResult(
+    info: import('./types.js').JobInfo | undefined,
+    options: { expanded: boolean },
+    theme: Theme,
+    extra?: { timedOut?: boolean; backgrounded?: boolean; isError?: boolean },
+  ) {
+    if (!info) {
+      return new Text(theme.fg('error', '✗ job not found'), 0, 0);
+    }
+    const status = info.status ?? (extra?.isError ? 'error' : 'completed');
+    const icon = status === 'completed' ? '✓' : status === 'running' || status === 'queued' ? '●' : '✗';
+    const color =
+      status === 'completed'
+        ? 'success'
+        : status === 'running' || status === 'queued'
+          ? 'warning'
+          : 'error';
+    const suffix = extra?.backgrounded
+      ? ' (paused wait)'
+      : extra?.timedOut && (status === 'running' || status === 'queued')
+        ? ' (timed out, still running)'
+        : '';
+    const out = (info.output ?? info.error ?? '').trim();
+    const hint =
+      !options.expanded && out && status === 'completed' ? theme.fg('dim', ' (click/ctrl+o to expand)') : '';
+    const header = new Text(`${theme.fg(color, `${icon} ${status}${suffix}`)}${hint}`, 0, 0);
+    if (!options.expanded || !out) return header;
+    const container = new Container();
+    container.addChild(header);
+    container.addChild(new Spacer(1));
+    container.addChild(new Markdown(out, 0, 0, buildMarkdownTheme(theme)));
+    return container;
+  }
+
   pi.registerTool<typeof JobStatusParams, { job?: import('./types.js').JobInfo }>({
     name: 'job_status',
     label: 'Job Status',
     description:
-      'Get the current status of a shell or subagent job (queued, running, completed, error, or cancelled). Use it only when the user asks for status; a background job reports its completion on its own.',
+      'Get the current status of a shell or subagent job (queued, running, completed, error, or cancelled). Accepts the job/shell ID or subagent description/title. Use it only when the user asks for status; a background job reports its completion on its own.',
     parameters: JobStatusParams,
     async execute(_id, input: JobStatusInput) {
       const job = jobs.get(input.id);
       if (job && job.status !== 'running' && job.status !== 'queued') {
-        jobs.suppressNotification(input.id);
+        jobs.suppressNotification(job.id);
         if (job.notificationId) jobs.completeBackground(job.notificationId);
       }
       return {
@@ -542,35 +610,72 @@ export default function agentOrchestrator(pi: ExtensionAPI): void {
         details: { job },
       };
     },
+    renderCall(args, theme) {
+      return renderJobCallLabel('job_status', args.id, theme);
+    },
+    renderResult(result, options, theme, context) {
+      return renderJobStatusResult(result.details?.job, options, theme, {
+        isError: Boolean(context?.isError),
+      });
+    },
   });
 
-  pi.registerTool<typeof JobWaitParams, { job?: import('./types.js').JobInfo; timedOut: boolean }>({
+  pi.registerTool<
+    typeof JobWaitParams,
+    { info?: import('./types.js').JobInfo; timedOut: boolean; backgrounded?: boolean; aborted?: boolean }
+  >({
     name: 'job_wait',
     label: 'Job Wait',
     description:
-      'Wait for a queued or running job to finish, or until the optional timeout. Prefer the automatic completion notice; use this only when you need the result right now.',
+      'Wait for a queued or running job to finish, or until the optional timeout. Accepts the job/shell ID or subagent description/title. Prefer the automatic completion notice; use this only when you need the result right now.',
     parameters: JobWaitParams,
-    async execute(_id, input: JobWaitInput) {
-      const result = await jobs.wait(input.id, input.timeout);
-      if (!result.timedOut && result.info?.notificationId) {
-        jobs.completeBackground(result.info.notificationId);
+    async execute(_id, input: JobWaitInput, signal, _update, toolCtx) {
+      const result = await jobs.wait(input.id, input.timeout, {
+        sessionId: toolCtx.sessionManager.getSessionId(),
+        signal,
+      });
+      if (!result.timedOut && result.info) {
+        jobs.suppressNotification(result.info.id);
+        if (result.info.notificationId) {
+          jobs.completeBackground(result.info.notificationId);
+        }
       }
+      const payload =
+        result.backgrounded && result.info
+          ? {
+              ...result.info,
+              timedOut: true,
+              waitInterrupted:
+                'Stopped waiting because the user sent a message. The job is still running in the background and will report completion automatically; respond to the user first instead of calling job_wait again.',
+            }
+          : result.info;
       return {
         content: [
           {
             type: 'text',
-            text: result.info ? JSON.stringify(result.info, null, 2) : `Job not found: ${input.id}`,
+            text: payload ? JSON.stringify(payload, null, 2) : `Job not found: ${input.id}`,
           },
         ],
         details: result,
       };
+    },
+    renderCall(args, theme) {
+      return renderJobCallLabel('job_wait', args.id, theme);
+    },
+    renderResult(result, options, theme, context) {
+      return renderJobStatusResult(result.details?.info, options, theme, {
+        timedOut: result.details?.timedOut,
+        backgrounded: result.details?.backgrounded,
+        isError: Boolean(context?.isError),
+      });
     },
   });
 
   pi.registerTool<typeof JobBackgroundParams, { job?: import('./types.js').JobInfo }>({
     name: 'job_background',
     label: 'Background Job',
-    description: 'Move a running foreground job to the background. The parent session is notified when it finishes.',
+    description:
+      'Move a running foreground job to the background. Accepts the job/shell ID or subagent description/title. The parent session is notified when it finishes.',
     parameters: JobBackgroundParams,
     async execute(_id, input: JobBackgroundInput) {
       const job = jobs.background(input.id);
@@ -581,24 +686,41 @@ export default function agentOrchestrator(pi: ExtensionAPI): void {
         details: { job },
       };
     },
+    renderCall(args, theme) {
+      return renderJobCallLabel('job_background', args.id, theme);
+    },
+    renderResult(result, options, theme, context) {
+      return renderJobStatusResult(result.details?.job, options, theme, {
+        isError: Boolean(context?.isError),
+      });
+    },
   });
 
   pi.registerTool<typeof JobCancelParams, { job?: import('./types.js').JobInfo }>({
     name: 'job_cancel',
     label: 'Cancel Job',
-    description: 'Cancel a running shell or subagent job.',
+    description: 'Cancel a running shell or subagent job. Accepts the job/shell ID or subagent description/title.',
     parameters: JobCancelParams,
     async execute(_id, input: JobCancelInput) {
-      jobs.suppressNotification(input.id);
-      await subagents.abort(input.id);
-      await shellManager.cancel(input.id);
-      const job = await jobs.cancel(input.id);
+      const resolvedId = jobs.resolveId(input.id);
+      jobs.suppressNotification(resolvedId);
+      await subagents.abort(resolvedId);
+      await shellManager.cancel(resolvedId);
+      const job = await jobs.cancel(resolvedId);
       return {
         content: [
           { type: 'text', text: job ? JSON.stringify(job, null, 2) : `Job not found: ${input.id}` },
         ],
         details: { job },
       };
+    },
+    renderCall(args, theme) {
+      return renderJobCallLabel('job_cancel', args.id, theme);
+    },
+    renderResult(result, options, theme, context) {
+      return renderJobStatusResult(result.details?.job, options, theme, {
+        isError: Boolean(context?.isError),
+      });
     },
   });
 
@@ -609,16 +731,20 @@ export default function agentOrchestrator(pi: ExtensionAPI): void {
       'Read a bounded range of a shell command output. The offset and limit are in bytes; avoid reading the same range repeatedly.',
     parameters: ShellOutputParams,
     async execute(_id, input: ShellOutputInput) {
-      const output = await shellManager.output(input.shellID, input.offset, input.limit);
+      const resolvedId = jobs.resolveId(input.shellID);
+      const output = await shellManager.output(resolvedId, input.offset, input.limit);
       const isFinished = output.status !== 'running' && output.status !== 'queued';
       if (isFinished) {
-        jobs.suppressNotification(input.shellID);
+        jobs.suppressNotification(resolvedId);
       }
       const includeStatusFooter = isFinished && (input.limit === undefined || input.limit >= 256);
       const statusFooter = includeStatusFooter
         ? `\n[Process ${output.status}${output.exit !== undefined ? ` (exit code ${output.exit})` : ''}]`
         : '';
       return { content: [{ type: 'text', text: `${output.output}${statusFooter}` }], details: { output } };
+    },
+    renderCall(args, theme) {
+      return renderJobCallLabel('shell_output', args.shellID, theme);
     },
   });
 

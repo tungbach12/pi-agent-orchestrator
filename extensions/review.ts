@@ -59,12 +59,23 @@ function successfulCheck(tool: ToolRecord): boolean {
   return !/(?:Command timed out after|Timed out before completion|Command aborted|Killed by \w+|Command cancelled|\b(?:FAIL|FAILED|BUILD FAILED|ERROR)\b)/i.test(output);
 }
 
-function isVerificationCommand(tool: ToolRecord): boolean {
-  const command = String((tool.input as { command?: unknown } | undefined)?.command ?? '').trim();
-  if (!command) return false;
-  const normalized = command.toLowerCase().replace(/\\/g, '/');
-  if (/[\n;&|<>`]/.test(normalized) || normalized.includes('$(') || /\b(?:sudo|env|command|time|nohup)\b/.test(normalized)) return false;
-  const executable = normalized.match(/(?:^|\s)(?:\.\/)?(?:\S*\/)?([\w.-]+)(?:\s|$)/)?.[1];
+function stripQuotes(text: string): string {
+  return text.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, '""');
+}
+
+function isSingleVerificationSegment(segment: string): boolean {
+  let trimmed = segment.trim();
+  if (!trimmed) return false;
+
+  // Strip leading environment variable assignments (e.g. `CI=true MSYS_NO_PATHCONV=1 npm test`)
+  while (/^[a-z_][a-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+/i.test(trimmed)) {
+    trimmed = trimmed.replace(/^[a-z_][a-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+/i, '').trim();
+  }
+  if (!trimmed) return false;
+
+  const normalized = trimmed.toLowerCase().replace(/\\/g, '/');
+  if (/\b(?:sudo|env|command|time|nohup)\b/.test(normalized)) return false;
+  const executable = normalized.match(/^(?:\.\/)?(?:\S*\/)?([\w.-]+)(?:\s|$)/)?.[1];
   const args = normalized.slice(normalized.indexOf(executable ?? '') + (executable?.length ?? 0)).trim();
   if (!executable) return false;
 
@@ -83,6 +94,9 @@ function isVerificationCommand(tool: ToolRecord): boolean {
   if (executable === 'dotnet' || executable === 'make') {
     return /^(?:test|check|verify|lint|typecheck|build)(?:\s|$)/.test(args) && !hasMutationFlag;
   }
+  if (executable === 'git') {
+    return /^(?:-c\s+\S+\s+|--no-pager\s+)*diff\s+--check(?:\s|$)/.test(args);
+  }
   if (['mvn', 'mvnw', 'mvnw.cmd', 'gradle', 'gradlew', 'gradlew.bat', 'cargo', 'go', 'pytest', 'vitest', 'jest', 'flutter', 'dart', 'tsc', 'eslint', 'ruff', 'rubocop', 'npx'].includes(executable)) {
     const allowed = /\b(test|check|verify|lint|typecheck|build|compile|analyze|analyse|vet|clippy|fmt|format)\b/.test(args) ||
       ['pytest', 'vitest', 'jest', 'ruff'].includes(executable) ||
@@ -96,6 +110,42 @@ function isVerificationCommand(tool: ToolRecord): boolean {
     return allowed && !hasMutationFlag;
   }
   return false;
+}
+
+function isAllowedChainHelperSegment(segment: string): boolean {
+  const trimmed = segment.trim().toLowerCase().replace(/\\/g, '/');
+  if (!trimmed) return true;
+  if (/^(?:cd|pushd|popd|pwd|true)\b/.test(trimmed)) return true;
+  // Allow spotless:apply / format steps when chained before a real verification check (e.g. `./mvnw spotless:apply && ./mvnw verify`)
+  if (/^(?:\.\/)?(?:\S*\/)?(?:mvn|mvnw|mvnw\.cmd|gradle|gradlew|gradlew\.bat)\s+.*\bspotless:apply\b/.test(trimmed)) {
+    return true;
+  }
+  if (/^git\s+(?:status|diff|add)\b/.test(trimmed)) return true;
+  return false;
+}
+
+function isVerificationCommand(tool: ToolRecord): boolean {
+  const command = String((tool.input as { command?: unknown } | undefined)?.command ?? '').trim();
+  if (!command) return false;
+  const unquoted = stripQuotes(command);
+  if (/[|<>`]|\|\||;\s*\S/.test(unquoted) || unquoted.includes('$(')) return false;
+
+  const segments = command
+    .replace(/\\\r?\n/g, ' ')
+    .split(/\s*&&\s*|\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (segments.length === 0) return false;
+
+  let hasVerificationSegment = false;
+  for (const seg of segments) {
+    if (isSingleVerificationSegment(seg)) {
+      hasVerificationSegment = true;
+    } else if (!isAllowedChainHelperSegment(seg)) {
+      return false;
+    }
+  }
+  return hasVerificationSegment;
 }
 
 /** Builds one fresh-context, read-only review request for the exact task. */

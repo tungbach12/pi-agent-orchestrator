@@ -74,6 +74,7 @@ Guidelines:
 - Make the smallest, cleanest change that satisfies the task requirements
 - Match the surrounding code style, naming, error handling, and architecture; do not reformat unrelated code or introduce speculative abstractions
 - Do not launch detached background processes or persistent servers via bash; run bounded verification commands
+- Prefer project-local wrapper scripts (such as \`./mvnw\`, \`./gradlew\`, or npm scripts in \`package.json\`) over global binaries when running build or test commands, and never scan the root filesystem (e.g. \`find /\`) to locate a binary
 - Run the project's relevant verification commands (tests, typecheck, lint, build) via bash after making changes, and fix any issues caused by your edits
 - Report concisely at the end:
   1. What changed and why (with exact file paths and line references)

@@ -38,6 +38,25 @@ import {
 
 /** Custom session entry that records which agent a child session belongs to. */
 const CHILD_ENTRY = 'pi-agent-orchestrator.child';
+
+/** Default timeout (in seconds) applied when a child session calls Pi's built-in `bash` tool without an explicit timeout. */
+const DEFAULT_CHILD_BASH_TIMEOUT_SEC = 120;
+
+function createChildBashTimeoutExtension(): (pi: {
+  on(event: 'tool_call', handler: (event: { toolName: string; input: unknown }) => undefined): void;
+}) => void {
+  return (pi) => {
+    pi.on('tool_call', (event) => {
+      if (event.toolName === 'bash' && event.input && typeof event.input === 'object') {
+        const input = event.input as { timeout?: unknown };
+        if (input.timeout === undefined) {
+          input.timeout = DEFAULT_CHILD_BASH_TIMEOUT_SEC;
+        }
+      }
+      return undefined;
+    });
+  };
+}
 const LEGACY_CHILD_ENTRY = 'pi-opencode-orchestrator.child';
 const SUBAGENTS_ENTRY = 'pi-agent-orchestrator.subagents.v1';
 const PERSISTED_SUBAGENT_LIMIT = 50;
@@ -231,6 +250,8 @@ export interface ChildSessionRecord extends ChildRecord {
   needsResume?: boolean;
   /** Queued steering prompts injected while the child is queued or running. */
   pendingSteers?: string[];
+  /** All steering prompts injected during the active run so the review gate sees mid-run updates. */
+  steeredHistory?: string[];
   /** True until the child has been prompted for the first time. */
   fresh: boolean;
   run: (prompt: string, signal?: AbortSignal) => Promise<string>;
@@ -542,7 +563,15 @@ export class SubagentManager {
   }
 
   get(sessionId: string): ChildSessionRecord | undefined {
-    return this.children.get(sessionId);
+    const direct = this.children.get(sessionId);
+    if (direct) return direct;
+    const needle = sessionId.trim().toLowerCase();
+    if (!needle) return undefined;
+    const ordered = [...this.children.values()].sort((a, b) => b.startedAt - a.startedAt);
+    return (
+      ordered.find((c) => c.description.trim().toLowerCase() === needle) ??
+      ordered.find((c) => c.description.toLowerCase().includes(needle))
+    );
   }
 
   /** Whether the given parent session currently has any running or queued subagent. */
@@ -648,6 +677,8 @@ export class SubagentManager {
         fresh: false,
       });
       child.lastPrompt = input.prompt.trim();
+      child.steeredHistory ??= [];
+      child.steeredHistory.push(input.prompt.trim());
       const liveSession = this.sessions.get(child.sessionId);
       if (
         existingJob?.status === 'running' &&
@@ -771,8 +802,33 @@ export class SubagentManager {
         const implementationToolCalls = new Set(child!.tools.map((tool) => tool.toolCallId).filter(Boolean));
         const implementation = await child!.run(prompt, controller.signal);
         if (!reviewRequested || controller.signal.aborted) return implementation;
+
+        const sessionUserTexts: string[] = [];
+        const liveSession = this.sessions.get(child!.sessionId);
+        if (Array.isArray(liveSession?.messages)) {
+          for (const msg of liveSession.messages as any[]) {
+            if (msg?.role !== 'user') continue;
+            const txt = Array.isArray(msg.content)
+              ? msg.content
+                  .filter((p: any) => p?.type === 'text' && typeof p.text === 'string')
+                  .map((p: any) => p.text.replace(new RegExp(`^${FRESH_PROMPT}\\r?\\n+`), '').trim())
+                  .filter((t: string) => t && t !== EMPTY_COMPLETION_NUDGE)
+                  .join('\n')
+              : '';
+            if (txt) sessionUserTexts.push(txt);
+          }
+        }
+        const extraUpdates = [
+          ...(child!.steeredHistory ?? []),
+          ...sessionUserTexts.slice(1),
+        ].filter((u, idx, arr) => u && !combinedPrompt.includes(u) && arr.indexOf(u) === idx);
+        const fullReviewTask =
+          extraUpdates.length > 0
+            ? `${combinedPrompt}\n\nSUBSEQUENT PARENT UPDATES / STEERING INSTRUCTIONS (SUPERSEDE EARLIER CONFLICTING DETAILS):\n${extraUpdates.map((u, i) => `${i + 1}. ${u}`).join('\n\n')}`
+            : combinedPrompt;
+
         const gate = await runReviewGate({
-          task: combinedPrompt,
+          task: fullReviewTask,
           implementationTools: child!.tools.slice(implementationToolStart)
             .filter((tool) => !tool.toolCallId || !implementationToolCalls.has(tool.toolCallId)),
 
@@ -786,11 +842,13 @@ export class SubagentManager {
         });
         if (controller.signal.aborted) return implementation;
         if (gate.verdict !== 'PASS') {
-          throw new Error(`Implementation was not verified (sessionID: ${child!.sessionId}). Review verdict: ${gate.verdict}. ${gate.review}`);
+          throw new Error(
+            `Implementation was not verified (sessionID: ${child!.sessionId}). Review verdict: ${gate.verdict}. ${gate.review}\n\nImplementer report:\n${implementation}`,
+          );
         }
         return gate.fixRounds === 0
           ? `Implementation verified against the task by an independent reviewer.\n\n${implementation}\n\nReview:\n${gate.review}`
-          : `Implementation verified after one bounded fix/review round.\n\n${gate.review}`;
+          : `Implementation verified after one bounded fix/review round.\n\n${implementation}\n\nReview:\n${gate.review}`;
       },
       cancel: () => child!.abort(),
       settled: (info) => this.onSettled(child!, info),
@@ -988,6 +1046,7 @@ export class SubagentManager {
       noExtensions: true,
       extensionFactories: [
         { name: 'orchestrator-codemode', factory: createCodemodeExtension() },
+        { name: 'orchestrator-bash-timeout', factory: createChildBashTimeoutExtension() },
         ...(isReadOnlyAgent(agent)
           ? [{ name: 'orchestrator-read-only', factory: createReadOnlyGuard({ cwd }) }]
           : []),
@@ -1075,6 +1134,7 @@ export class SubagentManager {
       noExtensions: true,
       extensionFactories: [
         { name: 'orchestrator-codemode', factory: createCodemodeExtension() },
+        { name: 'orchestrator-bash-timeout', factory: createChildBashTimeoutExtension() },
         ...(isReadOnlyAgent(agent)
           ? [{ name: 'orchestrator-read-only', factory: createReadOnlyGuard({ cwd: ctx.cwd }) }]
           : []),
@@ -1370,12 +1430,13 @@ export class SubagentManager {
   }
 
   async abort(sessionId: string): Promise<void> {
-    if (!this.children.has(sessionId)) return;
-    this.running.get(sessionId)?.abort();
+    const target = this.get(sessionId);
+    if (!target) return;
+    this.running.get(target.sessionId)?.abort();
     // JobRegistry owns cancellation ordering: it marks the request, aborts the
     // session through the registered cancel callback, and only settles after
     // the prompt operation actually stops.
-    await this.jobs.cancel(sessionId);
+    await this.jobs.cancel(target.sessionId);
   }
 
   /** Used by the tests to keep ids stable. */

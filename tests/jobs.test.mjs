@@ -205,3 +205,72 @@ test('backgroundAll moves only the jobs the session is blocking', async () => {
   assert.equal(jobs.get('free')?.notificationId, undefined);
   assert.equal((await blocking)?.type, 'backgrounded');
 });
+
+test('backgroundAll and AbortSignal unblock active session wait() calls while keeping the job in the background', async () => {
+  const jobs = new JobRegistry();
+  const recovery = { kind: 'subagent', parentSessionId: 'parent', childSessionId: 'child-1', agent: 'code', description: 'build' };
+  let finish;
+  jobs.start({
+    id: 'child-1',
+    type: 'subagent',
+    title: 'build',
+    recovery,
+    run: () => new Promise((resolve) => { finish = resolve; }),
+  });
+  await Promise.resolve();
+  jobs.background('child-1');
+
+  const waiting = jobs.wait('child-1', undefined, { sessionId: 'parent' });
+  await Promise.resolve();
+
+  const moved = jobs.backgroundAll('parent');
+  assert.deepEqual(moved.map((job) => job.id), ['child-1']);
+  const waitResult = await waiting;
+  assert.equal(waitResult.timedOut, true);
+  assert.equal(waitResult.backgrounded, true);
+  assert.equal(waitResult.info?.status, 'running');
+  assert.ok(jobs.get('child-1')?.notificationId, 'job retains its background notification id');
+
+  const abortController = new AbortController();
+  const abortWaiting = jobs.wait('child-1', undefined, { sessionId: 'parent', signal: abortController.signal });
+  abortController.abort();
+  const abortResult = await abortWaiting;
+  assert.equal(abortResult.timedOut, true);
+  assert.equal(abortResult.aborted, true);
+
+  finish('all done');
+  const finalResult = await jobs.wait('child-1');
+  assert.equal(finalResult.info?.status, 'completed');
+});
+
+test('get, wait, background, and cancel resolve jobs by title or description in addition to UUID', async () => {
+  const jobs = new JobRegistry();
+  let finish;
+  jobs.start({
+    id: '01a17b76-ba8d-71b9-b092-fafe76f7b33e',
+    type: 'subagent',
+    title: 'Explore existing docs and templates',
+    recovery: {
+      kind: 'subagent',
+      parentSessionId: 'parent',
+      childSessionId: '01a17b76-ba8d-71b9-b092-fafe76f7b33e',
+      agent: 'explore',
+      description: 'Explore existing docs and templates',
+    },
+    run: () => new Promise((resolve) => { finish = resolve; }),
+  });
+  await Promise.resolve();
+
+  assert.equal(jobs.get('Explore existing docs and templates')?.id, '01a17b76-ba8d-71b9-b092-fafe76f7b33e');
+  assert.equal(jobs.get('existing docs')?.id, '01a17b76-ba8d-71b9-b092-fafe76f7b33e');
+
+  const bg = jobs.background('Explore existing docs and templates');
+  assert.equal(bg?.id, '01a17b76-ba8d-71b9-b092-fafe76f7b33e');
+
+  finish('inventory complete');
+  const waited = await jobs.wait('Explore existing docs and templates');
+  assert.equal(waited.info?.status, 'completed');
+  assert.equal(waited.info?.output, 'inventory complete');
+});
+
+
